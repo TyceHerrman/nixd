@@ -69,6 +69,7 @@ void Controller::createWorkDoneProgress(
 Controller::Controller(std::unique_ptr<lspserver::InboundPort> In,
                        std::unique_ptr<lspserver::OutboundPort> Out)
     : LSPServer(std::move(In), std::move(Out)) {
+  Root.path = std::filesystem::current_path();
 
   // Life Cycle
   Registry.addMethod("initialize", this, &Controller::onInitialize);

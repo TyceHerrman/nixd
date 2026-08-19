@@ -12,6 +12,7 @@
 
 #include <boost/asio/thread_pool.hpp>
 
+#include <filesystem>
 #include <set>
 
 namespace nixd {
@@ -32,6 +33,7 @@ private:
   // e.g. "nixos" -> nixos worker
   //      "home-manager" -> home-manager worker
   OptionMapTy Options; // GUARDED_BY(OptionsLock)
+  std::set<std::string> ActiveOptions; // GUARDED_BY(OptionsLock)
 
   AttrSetClientProc &nixpkgsEval() {
     assert(NixpkgsEval);
@@ -49,6 +51,12 @@ private:
 
   std::mutex ConfigLock;
   Configuration Config; // GUARDED_BY(ConfigLock)
+  Configuration BaseConfig;
+
+  struct WorkspaceRoot {
+    std::filesystem::path path;
+  } Root;
+  std::optional<ProjectConfigError> ProjectConfigError;
 
   llvm::unique_function<void(const lspserver::ConfigurationParams &,
                              lspserver::Callback<llvm::json::Value>)>
@@ -64,6 +72,9 @@ private:
 
   /// \brief Get configuration from LSP client. Update the config.
   void fetchConfig();
+
+  Configuration builtinConfig() const;
+  void selectBaseConfig(const lspserver::InitializeParams &Params);
 
   llvm::unique_function<void(const lspserver::PublishDiagnosticsParams &)>
       PublishDiagnostic;

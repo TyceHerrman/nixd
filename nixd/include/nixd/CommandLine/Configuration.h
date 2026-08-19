@@ -5,10 +5,16 @@
 #include "nixd/Controller/Configuration.h"
 
 #include <exception>
+#include <optional>
 
 namespace nixd {
 
-/// \brief Parse the CLI flag and initialize the config nixd::DefaultConfig
-nixd::Configuration parseCLIConfig();
+struct CommandLineConfiguration {
+  std::optional<nixd::Configuration> config;
+  bool enableProjectConfig = false;
+};
+
+/// \brief Parse the CLI configuration source and project-config opt-in.
+CommandLineConfiguration parseCLIConfig();
 
 } // namespace nixd

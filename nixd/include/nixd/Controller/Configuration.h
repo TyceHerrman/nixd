@@ -5,6 +5,7 @@
 #include <llvm/Support/JSON.h>
 
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -47,6 +48,43 @@ bool fromJSON(const llvm::json::Value &Params,
 
 bool fromJSON(const llvm::json::Value &Params, Configuration &R,
               llvm::json::Path P);
+
+struct ConfigurationPatch {
+  struct Formatting {
+    std::optional<std::vector<std::string>> command;
+  };
+  struct NixpkgsProvider {
+    std::optional<std::string> expr;
+  };
+  struct Diagnostic {
+    std::optional<std::vector<std::string>> suppress;
+  };
+
+  std::optional<Formatting> formatting;
+  std::optional<std::map<std::string, Configuration::OptionProvider>> options;
+  std::optional<NixpkgsProvider> nixpkgs;
+  std::optional<Diagnostic> diagnostic;
+};
+
+bool fromJSON(const llvm::json::Value &Params, ConfigurationPatch &R,
+              llvm::json::Path P);
+Configuration overlay(Configuration Base, const ConfigurationPatch &Patch);
+
+enum class ProjectConfigErrorKind { IOError, JSONError, SchemaError };
+
+struct ProjectConfigError {
+  ProjectConfigErrorKind kind;
+  std::string path;
+  std::string message;
+};
+
+struct ProjectConfigLoadResult {
+  std::optional<Configuration> config;
+  std::optional<ProjectConfigError> error;
+};
+
+/// Load exactly the project root's .nixd.json, without ancestor traversal.
+ProjectConfigLoadResult loadProjectConfig(llvm::StringRef Root);
 
 // NOLINTEND(readability-identifier-naming)
 

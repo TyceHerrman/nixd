@@ -83,9 +83,38 @@ void Controller::evalExprWithProgress(AttrSetClient &Client,
   Client.evalExpr(Params, std::move(Action));
 }
 
+Configuration Controller::builtinConfig() const {
+  Configuration Result;
+  Result.nixpkgs.expr = getDefaultNixpkgsExpr();
+  Result.options.emplace("nixos", Configuration::OptionProvider{
+                                      .expr = getDefaultNixOSOptionsExpr(),
+                                  });
+  return Result;
+}
+
+void Controller::selectBaseConfig(const InitializeParams &Params) {
+  if (Params.rootUri && *Params.rootUri)
+    Root.path = Params.rootUri->file().str();
+  else if (Params.rootPath && !Params.rootPath->empty())
+    Root.path = *Params.rootPath;
+
+  CommandLineConfiguration CLI = parseCLIConfig();
+  ProjectConfigError.reset();
+  if (CLI.config) {
+    BaseConfig = *CLI.config;
+  } else if (CLI.enableProjectConfig) {
+    ProjectConfigLoadResult Loaded = loadProjectConfig(Root.path.string());
+    ProjectConfigError = std::move(Loaded.error);
+    BaseConfig = Loaded.config.value_or(builtinConfig());
+  } else {
+    BaseConfig = builtinConfig();
+  }
+  updateConfig(BaseConfig);
+}
+
 void Controller::
     onInitialize( // NOLINT(readability-convert-member-functions-to-static)
-        [[maybe_unused]] const InitializeParams &Params,
+        const InitializeParams &Params,
         Callback<Value> Reply) {
 
   Object ServerCaps{
@@ -174,22 +203,14 @@ void Controller::
   // Start default workers.
   startNixpkgs(NixpkgsEval);
 
-  if (nixpkgsClient()) {
-    evalExprWithProgress(*nixpkgsClient(), getDefaultNixpkgsExpr(),
-                         "nixpkgs entries");
-  }
-
-  // Launch nixos worker also.
+  // Create the default worker now; updateConfig() selects and evaluates its
+  // active configuration after all source precedence has been resolved.
   {
     std::lock_guard _(OptionsLock);
     startOption("nixos", Options["nixos"]);
-
-    if (AttrSetClient *Client = Options["nixos"]->client())
-      evalExprWithProgress(*Client, getDefaultNixOSOptionsExpr(),
-                           "nixos options");
   }
   try {
-    Config = parseCLIConfig();
+    selectBaseConfig(Params);
   } catch (LLVMErrorException &Err) {
     lspserver::elog("parse CLI config error: {0}, {1}", Err.what(),
                     Err.takeError());

@@ -1,0 +1,16 @@
+{
+  "formatting": {
+    "command": ["sh", "-c", "printf project-format"]
+  },
+  "nixpkgs": {
+    "expr": "{ project.meta.description = \"project nixpkgs\"; }"
+  },
+  "options": {
+    "project": {
+      "expr": "{ project.option = { _type = \"option\"; }; }"
+    }
+  },
+  "diagnostic": {
+    "suppress": ["unused_binding"]
+  }
+}

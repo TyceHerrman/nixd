@@ -1,7 +1,11 @@
 #include "nixd/Controller/Controller.h"
 #include "nixd/Eval/Launch.h"
+#include "nixd/Support/JSON.h"
 
 #include <boost/asio/post.hpp>
+
+#include <cstring>
+#include <fstream>
 
 using namespace nixd;
 using namespace lspserver;
@@ -47,6 +51,125 @@ bool nixd::fromJSON(const Value &Params, Configuration &R, llvm::json::Path P) {
       ;
 }
 
+namespace {
+
+template <typename T>
+bool mapPatchField(const llvm::json::Object &Object, llvm::StringRef Name,
+                   std::optional<T> &Result, llvm::json::Path P);
+
+bool fromJSON(const Value &Params, ConfigurationPatch::Formatting &R,
+              llvm::json::Path P) {
+  if (auto String = Params.getAsString()) {
+    R.command = {String->str()};
+    return true;
+  }
+  const auto *Object = Params.getAsObject();
+  if (!Object) {
+    P.report("expected object or string");
+    return false;
+  }
+  return mapPatchField(*Object, "command", R.command, std::move(P));
+}
+
+bool fromJSON(const Value &Params, ConfigurationPatch::NixpkgsProvider &R,
+              llvm::json::Path P) {
+  const auto *Object = Params.getAsObject();
+  if (!Object) {
+    P.report("expected object");
+    return false;
+  }
+  return mapPatchField(*Object, "expr", R.expr, std::move(P));
+}
+
+bool fromJSON(const Value &Params, ConfigurationPatch::Diagnostic &R,
+              llvm::json::Path P) {
+  const auto *Object = Params.getAsObject();
+  if (!Object) {
+    P.report("expected object");
+    return false;
+  }
+  return mapPatchField(*Object, "suppress", R.suppress, std::move(P));
+}
+
+template <typename T>
+bool mapPatchField(const llvm::json::Object &Object, llvm::StringRef Name,
+                   std::optional<T> &Result, llvm::json::Path P) {
+  const Value *Field = Object.get(Name);
+  if (!Field)
+    return true;
+  T Parsed;
+  if (!fromJSON(*Field, Parsed, P.field(Name)))
+    return false;
+  Result = std::move(Parsed);
+  return true;
+}
+
+} // namespace
+
+bool nixd::fromJSON(const Value &Params, ConfigurationPatch &R,
+                    llvm::json::Path P) {
+  const auto *Object = Params.getAsObject();
+  if (!Object) {
+    P.report("expected object");
+    return false;
+  }
+  return mapPatchField(*Object, "formatting", R.formatting, P) &&
+         mapPatchField(*Object, "options", R.options, P) &&
+         mapPatchField(*Object, "nixpkgs", R.nixpkgs, P) &&
+         mapPatchField(*Object, "diagnostic", R.diagnostic, std::move(P));
+}
+
+Configuration nixd::overlay(Configuration Base,
+                            const ConfigurationPatch &Patch) {
+  if (Patch.formatting && Patch.formatting->command)
+    Base.formatting.command = *Patch.formatting->command;
+  if (Patch.options)
+    Base.options = *Patch.options;
+  if (Patch.nixpkgs && Patch.nixpkgs->expr)
+    Base.nixpkgs.expr = *Patch.nixpkgs->expr;
+  if (Patch.diagnostic && Patch.diagnostic->suppress)
+    Base.diagnostic.suppress = *Patch.diagnostic->suppress;
+  return Base;
+}
+
+ProjectConfigLoadResult nixd::loadProjectConfig(llvm::StringRef Root) {
+  const std::string Path = (std::filesystem::path(Root.str()) / ".nixd.json").string();
+  std::ifstream Input(Path);
+  if (!Input) {
+    if (!std::filesystem::exists(Path))
+      return {};
+    return {.error = ProjectConfigError{
+                .kind = ProjectConfigErrorKind::IOError,
+                .path = Path,
+                .message = std::strerror(errno),
+            }};
+  }
+
+  std::string Contents{std::istreambuf_iterator<char>(Input), {}};
+  if (Input.bad()) {
+    return {.error = ProjectConfigError{
+                .kind = ProjectConfigErrorKind::IOError,
+                .path = Path,
+                .message = std::strerror(errno),
+            }};
+  }
+  try {
+    return {.config = nixd::fromJSON<Configuration>(nixd::parse(Contents))};
+  } catch (const JSONParseException &Err) {
+    return {.error = ProjectConfigError{
+                .kind = ProjectConfigErrorKind::JSONError,
+                .path = Path,
+                .message = Err.what(),
+            }};
+  } catch (const JSONSchemaException &Err) {
+    return {.error = ProjectConfigError{
+                .kind = ProjectConfigErrorKind::SchemaError,
+                .path = Path,
+                .message = Err.what(),
+            }};
+  }
+}
+
 void Controller::onDidChangeConfiguration(
     const DidChangeConfigurationParams &Params) {
   // FIXME: incrementally change?
@@ -54,32 +177,37 @@ void Controller::onDidChangeConfiguration(
 }
 
 void Controller::updateConfig(Configuration NewConfig) {
-  std::lock_guard G(ConfigLock);
-  Config = std::move(NewConfig);
+  {
+    std::lock_guard G(ConfigLock);
+    Config = NewConfig;
+  }
 
-  if (!Config.nixpkgs.expr.empty()) {
+  if (!NewConfig.nixpkgs.expr.empty()) {
     /// Evaluate nixpkgs and options, using user-provided config.
     if (nixpkgsClient()) {
-      evalExprWithProgress(*nixpkgsClient(), Config.nixpkgs.expr,
+      evalExprWithProgress(*nixpkgsClient(), NewConfig.nixpkgs.expr,
                            "nixpkgs entries");
     }
   }
-  if (!Config.options.empty()) {
+  {
     std::lock_guard _(OptionsLock);
+    ActiveOptions.clear();
     // For each option configuration, update the worker.
-    for (const auto &[Name, Opt] : Config.options) {
+    for (const auto &[Name, Opt] : NewConfig.options) {
+      ActiveOptions.insert(Name);
       auto &Client = Options[Name];
       if (!Client) {
         // If it does not exist. Launch a new client.
         startOption(Name, Client);
       }
       assert(Client);
-      evalExprWithProgress(*Client->client(), Opt.expr, Name);
+      if (AttrSetClient *Worker = Client->client())
+        evalExprWithProgress(*Worker, Opt.expr, Name);
     }
   }
 
   // Update the diagnostic part.
-  updateSuppressed(Config.diagnostic.suppress);
+  updateSuppressed(NewConfig.diagnostic.suppress);
 
   // After all, notify all AST modules the diagnostic set has been updated.
   std::lock_guard TUsGuard(TUsLock);
@@ -101,20 +229,28 @@ void Controller::fetchConfig() {
                       *Resp);
       return;
     }
-    const Value &FirstConfig = Resp->getAsArray()->front();
+    const auto &Responses = *Resp->getAsArray();
+    if (Responses.empty() || Responses.front().kind() == Value::Null)
+      return;
+    const Value &FirstConfig = Responses.front();
 
     // Run this job in the thread pool. Don't block input thread.
     auto ConfigAction = [this, FirstConfig]() mutable {
       // Parse the config
-      Configuration NewConfig;
+      ConfigurationPatch Patch;
       llvm::json::Path::Root P;
-      if (!fromJSON(FirstConfig, NewConfig, P)) {
+      if (!fromJSON(FirstConfig, Patch, P)) {
         elog("workspace/configuration: parse error {0}", P.getError());
         return;
       }
 
       // OK, update the config
-      updateConfig(std::move(NewConfig));
+      Configuration Base;
+      {
+        std::lock_guard G(ConfigLock);
+        Base = BaseConfig;
+      }
+      updateConfig(overlay(std::move(Base), Patch));
     };
 
     boost::asio::post(Pool, std::move(ConfigAction));

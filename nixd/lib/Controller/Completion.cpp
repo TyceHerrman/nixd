@@ -340,9 +340,13 @@ public:
 void completeAttrName(const lspserver::Range EditRange,
                       const std::vector<std::string> &Scope,
                       const std::string &Prefix,
-                      Controller::OptionMapTy &Options, bool CompletionSnippets,
+                      Controller::OptionMapTy &Options,
+                      const std::set<std::string> &ActiveOptions,
+                      bool CompletionSnippets,
                       std::vector<CompletionItem> &List) {
   for (const auto &[Name, Provider] : Options) {
+    if (!ActiveOptions.contains(Name))
+      continue;
     AttrSetClient *Client = Options.at(Name)->client();
     if (!Client) [[unlikely]] {
       elog("skipped client {0} as it is dead", Name);
@@ -355,7 +359,8 @@ void completeAttrName(const lspserver::Range EditRange,
 
 void completeAttrPath(const lspserver::Range EditRange, const Node &N,
                       const ParentMapAnalysis &PM, std::mutex &OptionsLock,
-                      Controller::OptionMapTy &Options, bool Snippets,
+                      Controller::OptionMapTy &Options,
+                      const std::set<std::string> &ActiveOptions, bool Snippets,
                       std::vector<lspserver::CompletionItem> &Items) {
   std::vector<std::string> Scope;
   using PathResult = FindAttrPathResult;
@@ -366,7 +371,8 @@ void completeAttrPath(const lspserver::Range EditRange, const Node &N,
     Scope.pop_back();
     {
       std::lock_guard _(OptionsLock);
-      completeAttrName(EditRange, Scope, Prefix, Options, Snippets, Items);
+      completeAttrName(EditRange, Scope, Prefix, Options, ActiveOptions,
+                       Snippets, Items);
     }
   }
 }
@@ -508,7 +514,8 @@ void Controller::onCompletion(const CompletionParams &Params,
           }
           case Node::NK_ExprAttrs: {
             completeAttrPath(EditRange, N, PM, OptionsLock, Options,
-                             ClientCaps.CompletionSnippets, List.items);
+                             ActiveOptions, ClientCaps.CompletionSnippets,
+                             List.items);
             return List;
           }
           default:
