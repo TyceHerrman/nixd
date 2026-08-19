@@ -29,6 +29,17 @@ def exercise_missing():
 
 def exercise_invalid(kind):
     with tempfile.TemporaryDirectory() as root:
+        bin_dir = Path(root) / "bin"
+        bin_dir.mkdir()
+        formatter = bin_dir / "nixfmt"
+        formatter.write_text(
+            "#!/bin/sh\nprintf 'built-in formatter fallback'\n",
+            encoding="utf-8",
+        )
+        formatter.chmod(0o755)
+        env = os.environ.copy()
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+
         path = Path(root) / ".nixd.json"
         if kind == "io":
             path.symlink_to(path.name)
@@ -42,7 +53,7 @@ def exercise_invalid(kind):
         else:
             raise AssertionError(f"unknown invalid kind: {kind}")
 
-        client = Client(args=("--enable-project-config",), cwd=root)
+        client = Client(args=("--enable-project-config",), cwd=root, env=env)
         try:
             client.initialize(root_path=root)
             logged = client.read_stderr_until(
@@ -60,7 +71,9 @@ def exercise_invalid(kind):
             uri = "file:///startup-warning.nix"
             client.open_document(uri, "{ x = 1; }")
             response = client.formatting(20, uri)
-            assert response.get("id") == 20, response
+            assert response["result"][0]["newText"] == (
+                "built-in formatter fallback"
+            ), response
         finally:
             client.close()
 

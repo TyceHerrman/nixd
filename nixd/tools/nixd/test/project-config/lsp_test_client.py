@@ -3,6 +3,7 @@
 
 import json
 import os
+import resource
 import select
 import subprocess
 import time
@@ -11,7 +12,14 @@ TIMEOUT_SECONDS = 10
 
 
 class Client:
-    def __init__(self, *, args=(), cwd=None, env=None):
+    def __init__(self, *, args=(), cwd=None, env=None, fd_limit=None):
+        def limit_open_files():
+            _, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+            resource.setrlimit(
+                resource.RLIMIT_NOFILE,
+                (min(fd_limit, hard_limit), hard_limit),
+            )
+
         self.proc = subprocess.Popen(
             ["nixd", *args],
             cwd=cwd,
@@ -20,6 +28,7 @@ class Client:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            preexec_fn=limit_open_files if fd_limit is not None else None,
         )
         self.received = []
 

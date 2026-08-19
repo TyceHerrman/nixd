@@ -1,4 +1,5 @@
 #include "nixd/Support/ForkPiped.h"
+#include "nixd/Support/AutoCloseFD.h"
 
 #include <cerrno>
 
@@ -11,35 +12,41 @@ int nixd::forkPiped(int &In, int &Out, int &Err) {
   int PipeIn[2];
   int PipeOut[2];
   int PipeErr[2];
-  if (pipe(PipeIn) == -1 || pipe(PipeOut) == -1 || pipe(PipeErr) == -1)
+  if (pipe(PipeIn) == -1)
     throw std::system_error(errno, std::generic_category());
+  util::AutoCloseFD PipeInRead(PipeIn[READ]);
+  util::AutoCloseFD PipeInWrite(PipeIn[WRITE]);
+
+  if (pipe(PipeOut) == -1)
+    throw std::system_error(errno, std::generic_category());
+  util::AutoCloseFD PipeOutRead(PipeOut[READ]);
+  util::AutoCloseFD PipeOutWrite(PipeOut[WRITE]);
+
+  if (pipe(PipeErr) == -1)
+    throw std::system_error(errno, std::generic_category());
+  util::AutoCloseFD PipeErrRead(PipeErr[READ]);
+  util::AutoCloseFD PipeErrWrite(PipeErr[WRITE]);
 
   pid_t Child = fork();
 
   if (Child == 0) {
     // Redirect stdin, stdout, stderr.
-    close(PipeIn[WRITE]);
-    close(PipeOut[READ]);
-    close(PipeErr[READ]);
-    dup2(PipeIn[READ], STDIN_FILENO);
-    dup2(PipeOut[WRITE], STDOUT_FILENO);
-    dup2(PipeErr[WRITE], STDERR_FILENO);
-    close(PipeIn[READ]);
-    close(PipeOut[WRITE]);
-    close(PipeErr[WRITE]);
+    if (dup2(PipeIn[READ], STDIN_FILENO) == -1 ||
+        dup2(PipeOut[WRITE], STDOUT_FILENO) == -1 ||
+        dup2(PipeErr[WRITE], STDERR_FILENO) == -1)
+      _exit(127);
     // Child process.
     return 0;
   }
-
-  close(PipeIn[READ]);
-  close(PipeOut[WRITE]);
-  close(PipeErr[WRITE]);
 
   if (Child == -1)
     throw std::system_error(errno, std::generic_category());
 
   In = PipeIn[WRITE];
+  PipeInWrite.release();
   Out = PipeOut[READ];
-  Err = PipeOut[READ];
+  PipeOutRead.release();
+  Err = PipeErr[READ];
+  PipeErrRead.release();
   return Child;
 }
