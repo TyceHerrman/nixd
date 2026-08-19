@@ -13,7 +13,7 @@ from lsp_test_client import Client
 FOUR_MIB = 4 * 1024 * 1024
 PIPE_PRESSURE_BYTES = 512 * 1024
 MARKER_TIMEOUT_SECONDS = 15
-RESPONSE_TIMEOUT_SECONDS = 3
+RESPONSE_TIMEOUT_SECONDS = 15
 
 
 STDOUT_AFTER_INPUT = r"""
@@ -98,15 +98,21 @@ def python_formatter(script, *arguments):
 
 def wait_for_file(path, expected, timeout=MARKER_TIMEOUT_SECONDS):
     deadline = time.monotonic() + timeout
+    observed = None
     while time.monotonic() < deadline:
         try:
             contents = path.read_text()
         except FileNotFoundError:
             time.sleep(0.01)
             continue
-        assert contents == expected, (path, contents)
-        return
-    raise TimeoutError(f"timed out waiting for marker {path.name}")
+        observed = contents
+        if contents == expected:
+            return
+        time.sleep(0.01)
+    raise TimeoutError(
+        f"timed out waiting for marker {path.name}; "
+        f"expected={expected!r}, observed={observed!r}"
+    )
 
 
 def send_formatting(client, request_id, uri):

@@ -48,6 +48,13 @@ void reportSetupFailure(int FD, char Failure) {
 }
 
 ssize_t writeWithoutSigpipe(int FD, const void *Buffer, size_t Size) {
+#ifdef F_SETNOSIGPIPE
+  ssize_t Result;
+  do {
+    Result = write(FD, Buffer, Size);
+  } while (Result == -1 && errno == EINTR);
+  return Result;
+#else
   sigset_t Sigpipe;
   sigemptyset(&Sigpipe);
   sigaddset(&Sigpipe, SIGPIPE);
@@ -87,6 +94,19 @@ ssize_t writeWithoutSigpipe(int FD, const void *Buffer, size_t Size) {
   }
   errno = WriteError;
   return Result;
+#endif
+}
+
+std::error_code suppressSigpipe(int FD) {
+#ifdef F_SETNOSIGPIPE
+  int Result;
+  do {
+    Result = fcntl(FD, F_SETNOSIGPIPE, 1);
+  } while (Result == -1 && errno == EINTR);
+  if (Result == -1)
+    return std::error_code(errno, std::generic_category());
+#endif
+  return {};
 }
 
 std::error_code setNonBlocking(int FD) {
@@ -143,6 +163,14 @@ FormatterIOResult pumpFormatter(const std::string &Code,
                                 util::AutoCloseFD &Output,
                                 util::AutoCloseFD &Error, bool SendInput) {
   FormatterIOResult Result;
+
+  if (std::error_code EC = suppressSigpipe(Input.get())) {
+    Result.ConfigurationError = EC;
+    closeFD(Input);
+    closeFD(Output);
+    closeFD(Error);
+    return Result;
+  }
 
   for (int FD : {Input.get(), Output.get(), Error.get()}) {
     if (std::error_code EC = setNonBlocking(FD)) {
@@ -353,15 +381,15 @@ void Controller::onFormat(const DocumentFormattingParams &Params,
       return;
     }
 
-    if (IO.WriteError) {
-      Reply(error("failed to write formatter input: {0}",
-                  IO.WriteError.message()));
-      return;
-    }
-
     if (Exit != 0) {
       Reply(error("formatting {0} command exited with {1}", FormatCommand[0],
                   Exit));
+      return;
+    }
+
+    if (IO.WriteError) {
+      Reply(error("failed to write formatter input: {0}",
+                  IO.WriteError.message()));
       return;
     }
 

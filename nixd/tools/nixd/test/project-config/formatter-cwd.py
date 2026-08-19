@@ -31,11 +31,19 @@ def exercise(selector):
                 client.initialize(root_path=root)
                 client.initialized()
                 uri = (Path(root) / "document.nix").as_uri()
-                client.open_document(uri, "{ x = 1; }")
-                response = client.formatting(20, uri)
+                client.open_document(uri, " " * (512 * 1024))
+                try:
+                    response = client.formatting(20, uri)
+                except RuntimeError as error:
+                    stderr = client.close()
+                    raise AssertionError(
+                        f"nixd terminated during exit-125 formatting: "
+                        f"{client.proc.returncode}; stderr={stderr!r}"
+                    ) from error
                 assert response["error"]["message"].startswith(
                     "formatting sh command exited"
                 ), response
+                assert client.proc.poll() is None, client.proc.returncode
             finally:
                 client.close()
         return
