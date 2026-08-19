@@ -1,4 +1,5 @@
 # RUN: sed 's|ROOT|%S/fixtures/project|g' %s > %t && nixd --enable-project-config --lit-test < %t | FileCheck %s
+# RUN: python3 %S/file-editor-overlay.py | FileCheck %s --check-prefix=INTERACTIVE
 
 This catches editor patches that lose file-base fields, or rebuild from the
 previous editor configuration instead of the immutable project-file base.
@@ -67,6 +68,7 @@ previous editor configuration instead of the immutable project-file base.
 
 ```
 CHECK: "newText": "project-format"
+INTERACTIVE: interactive file overlay reset: project-format
 ```
 
 ```json

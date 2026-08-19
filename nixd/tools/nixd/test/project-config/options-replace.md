@@ -36,6 +36,7 @@ CHECK: "id": 3,
 CHECK-NOT: "label": "project"
 CHECK: "detail": "editor"
 CHECK: "label": "editor"
+CHECK-NOT: "label": "project"
 ```
 
 ```json
