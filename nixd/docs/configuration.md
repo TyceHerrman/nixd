@@ -33,13 +33,87 @@ For advanced users, e.g. having many custom modules, or want to extend anyother 
 * custom nixpkgs path, input from your "system" flake
 
 
-### Where to place the configuration
+### Configuration sources and precedence
 
-> In legacy versions (v1.x), configurations are written in ".nixd.json", please remove them and nixd won't even read such files anymore.
+> [!WARNING]
+> Only enable project configuration for workspaces you trust. A project file
+> can provide Nix expressions for nixd to evaluate and select formatter
+> executables for nixd to run.
 
-All configuration should go in `nixd` section.
-`nixd` accept language server protocol specified `workspace/configuration` to fetch config file.
-So the location of configuration file basically determined by your editor setup.
+Project configuration is disabled by default. To enable it, start nixd with:
+
+```console
+nixd --enable-project-config
+```
+
+nixd resolves one workspace root in this order: `rootUri`, a non-empty
+`rootPath`, then the directory in which nixd was launched. It reads exactly
+`<root>/.nixd.json`; it does not search parent directories or nested project
+files.
+
+The base configuration is selected in this order:
+
+1. A JSON object supplied with `--config`. Supplying this option suppresses
+   project-file loading, even with `--enable-project-config`.
+2. A valid, opted-in `<root>/.nixd.json`.
+3. nixd's built-in configuration.
+
+Editor settings returned through LSP `workspace/configuration` have the highest
+precedence and are applied as an overlay on the selected base. A project file
+or `--config` value is a complete base, not a patch over the built-in
+configuration. Omitted fields use their C++ value defaults: formatting remains
+`["nixfmt"]`, while omitted `nixpkgs` and `options` do not inherit the built-in
+expressions.
+
+Project files and `--config` contain the raw configuration object. Editor
+settings are wrapped in the client's `nixd` settings or section, as shown in
+the editor examples below.
+
+For editor overlays, omitted fields preserve their values from the selected
+base. Supplying `options` replaces the complete options map; it does not merge
+providers. A `workspace/configuration` result of `[null]` or `[{}]` removes all
+editor overrides and restores the base. Empty, malformed, or unsupported
+responses retain the active configuration.
+
+A missing `.nixd.json` is silent. An existing unreadable, invalid JSON, or
+schema-invalid file is logged with its exact path and error, produces one
+warning after initialization, and falls back to the built-in configuration. An
+invalid `--config` value is fatal. If a supplied root is unusable, nixd warns,
+skips project-file loading, and runs evaluator and formatter children from the
+launch directory.
+
+Changes to `.nixd.json` require restarting nixd. Filesystem watching, ancestor
+discovery, nested configuration files, and multi-root project configuration
+are not supported.
+
+The following is a complete modern `.nixd.json` example:
+
+```json
+{
+  "$schema": "https://json.schemastore.org/nixd-schema.json",
+  "nixpkgs": {
+    "expr": "import (builtins.getFlake (builtins.toString ./.)).inputs.nixpkgs { }"
+  },
+  "options": {
+    "nixos": {
+      "expr": "(builtins.getFlake (builtins.toString ./.)).nixosConfigurations.<hostname>.options"
+    },
+    "home-manager": {
+      "expr": "(builtins.getFlake (builtins.toString ./.)).homeConfigurations.\"<username>@<hostname>\".options"
+    }
+  },
+  "formatting": {
+    "command": ["nixfmt"]
+  },
+  "diagnostic": {
+    "suppress": ["sema-extra-with"]
+  }
+}
+```
+
+Replace the angle-bracket placeholders with names from your flake output.
+Relative evaluator expressions, imports, and formatter commands are resolved
+from the effective workspace root.
 
 
 > Please extend this list for your editor, thanks!
@@ -49,7 +123,7 @@ So the location of configuration file basically determined by your editor setup.
 
 For vscode users you should write `settings.json`[^settings] like this:
 
-[^settings]: the file could be applied per-workspace, i.e. `.vscode/settings.json`, our globally, remotely. VSCode users should familiar with [these locations](https://code.visualstudio.com/docs/getstarted/settings).
+[^settings]: the file can be applied per-workspace, for example in `.vscode/settings.json`, or globally or remotely. VSCode users should be familiar with [these locations](https://code.visualstudio.com/docs/getstarted/settings).
 
 
 ```
@@ -141,7 +215,8 @@ You can also set the `eglot-workspace-configuration` variable globally (by using
 ### Configuration overview
 
 > [!NOTE]
-> This annotated json are under the key "nixd". If you don't know what does exactly this mean please see editor examples above.
+> This annotated JSON is an editor configuration and belongs under the `nixd`
+> key. Project files and `--config` use the unwrapped object instead.
 
 ```jsonc
 {
@@ -163,8 +238,8 @@ You can also set the `eglot-workspace-configuration` variable globally (by using
   // Tell the language server your desired option set, for completion
   // This is lazily evaluated.
   "options": { // Map of eval information
-      // By default, this entriy will be read from `import <nixpkgs> { }`
-      // You can write arbitary nix expression here, to produce valid "options" declaration result.
+      // You can write an arbitrary Nix expression here that produces an
+      // option declarations attribute set.
       //
       // *NOTE*: Replace "<name>" below with your actual configuration name.
       // If you're unsure what to use, you can verify with `nix repl` by evaluating
@@ -180,13 +255,9 @@ You can also set the `eglot-workspace-configuration` variable globally (by using
     //  A. home-manager switch --flake .#... (standalone Home Manager)
     //  B. nixos-rebuild switch --flake .#... (NixOS with integrated Home Manager)
     //
-    // Configuration examples for both approaches are shown below.
+    // This entry is for standalone Home Manager (choice A).
     "home-manager": {
-      // A:
       "expr": "(builtins.getFlake (builtins.toString ./.)).homeConfigurations.<name>.options"
-
-      // B:
-      "expr": "(builtins.getFlake (builtins.toString ./.)).nixosConfigurations.<name>.options.home-manager.users.type.getSubOptions []"
     }
   },
   // Control the diagnostic system
@@ -195,6 +266,15 @@ You can also set the `eglot-workspace-configuration` variable globally (by using
       "sema-extra-with"
     ]
   }
+}
+```
+
+For Home Manager integrated into NixOS (choice B), replace the
+`home-manager` entry above with:
+
+```jsonc
+"home-manager": {
+  "expr": "(builtins.getFlake (builtins.toString ./.)).nixosConfigurations.<name>.options.home-manager.users.type.getSubOptions []"
 }
 ```
 
@@ -216,9 +296,11 @@ prefer to suppress diagnostics altogether. This can be achieved by utilizing the
 }
 ```
 
-#### Format ("formating")
+#### Format (`formatting`)
 
-To configure which command will be used for formatting, you can change the "formatting" section.
+To configure the external command and arguments used for formatting, change the
+`formatting` section. A direct string is shorthand for a one-element command
+array; an object without `command` retains the default `["nixfmt"]`.
 
 ```jsonc
 {
@@ -233,8 +315,10 @@ To configure which command will be used for formatting, you can change the "form
 
 This is our support for nixpkgs option system.
 
-Generally options are merged under a special attribute path.
-For example, NixOS options could be found at:
+Supplying an `options` object replaces the complete active provider map, so
+include every provider you want to keep. Provider names are arbitrary. The
+expression for each provider selects its option declarations. For example,
+NixOS options can be found at:
 
 ```
 <flakeref>#nixosConfigurations.<name>.options
@@ -253,9 +337,8 @@ In our option system, you need to specify which option set you'd like to use.
   // Tell the language server your desired option set, for completion
   // This is lazily evaluated.
   "options": { // Map of eval information
-    // If this is ommited, default search path (<nixpkgs>) will be used.
-    "nixos": { // This name "nixos" could be arbitary.
-      // The expression to eval, intepret it as option declarations.
+    "nixos": { // This provider name is arbitrary.
+      // Evaluate this expression as option declarations.
       "expr": "(builtins.getFlake \"/home/lyc/flakes\").nixosConfigurations.adrastea.options"
     },
 
