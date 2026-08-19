@@ -56,7 +56,10 @@ private:
   struct WorkspaceRoot {
     std::filesystem::path path;
   } Root;
+  std::filesystem::path LaunchDirectory;
+  bool SkipProjectConfig = false;
   std::optional<ProjectConfigError> ProjectConfigError;
+  std::optional<lspserver::ShowMessageParams> PendingStartupWarning;
 
   llvm::unique_function<void(const lspserver::ConfigurationParams &,
                              lspserver::Callback<llvm::json::Value>)>
@@ -74,10 +77,12 @@ private:
   void fetchConfig();
 
   Configuration builtinConfig() const;
-  void selectBaseConfig(const lspserver::InitializeParams &Params);
+  void selectWorkspaceRoot(const lspserver::InitializeParams &Params);
+  void selectBaseConfig();
 
   llvm::unique_function<void(const lspserver::PublishDiagnosticsParams &)>
       PublishDiagnostic;
+  llvm::unique_function<void(const lspserver::ShowMessageParams &)> ShowMessage;
   llvm::unique_function<void(const lspserver::WorkDoneProgressCreateParams &,
                              lspserver::Callback<std::nullptr_t>)>
       CreateWorkDoneProgress;

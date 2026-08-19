@@ -22,21 +22,28 @@ opt<std::string> NixpkgsWorkerStderr{
 } // namespace
 
 void nixd::startAttrSetEval(const std::string &Name,
-                            std::unique_ptr<AttrSetClientProc> &Worker) {
-  Worker = std::make_unique<AttrSetClientProc>([&Name]() {
+                            std::unique_ptr<AttrSetClientProc> &Worker,
+                            const std::filesystem::path &Root) {
+  Worker = std::make_unique<AttrSetClientProc>([Name, Root]() {
     freopen(Name.c_str(), "w", stderr);
+    if (chdir(Root.c_str()) != 0) {
+      perror("failed to change evaluator working directory");
+      return -1;
+    }
     return execl(AttrSetClient::getExe(), "nixd-attrset-eval", nullptr);
   });
 }
 
-void nixd::startNixpkgs(std::unique_ptr<AttrSetClientProc> &NixpkgsEval) {
-  startAttrSetEval(NixpkgsWorkerStderr, NixpkgsEval);
+void nixd::startNixpkgs(std::unique_ptr<AttrSetClientProc> &NixpkgsEval,
+                        const std::filesystem::path &Root) {
+  startAttrSetEval(NixpkgsWorkerStderr, NixpkgsEval, Root);
 }
 
 void nixd::startOption(const std::string &Name,
-                       std::unique_ptr<AttrSetClientProc> &Worker) {
+                       std::unique_ptr<AttrSetClientProc> &Worker,
+                       const std::filesystem::path &Root) {
   std::string NewName = NULL_DEVICE;
   if (OptionWorkerStderr.getNumOccurrences())
     NewName = OptionWorkerStderr.getValue() + "/" + Name;
-  startAttrSetEval(NewName, Worker);
+  startAttrSetEval(NewName, Worker, Root);
 }

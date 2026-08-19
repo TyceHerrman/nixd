@@ -15,6 +15,8 @@
 
 #include <llvm/Support/CommandLine.h>
 
+#include <unistd.h>
+
 using namespace nixd;
 using namespace util;
 using namespace llvm::json;
@@ -92,19 +94,64 @@ Configuration Controller::builtinConfig() const {
   return Result;
 }
 
-void Controller::selectBaseConfig(const InitializeParams &Params) {
+void Controller::selectWorkspaceRoot(const InitializeParams &Params) {
+  std::optional<std::filesystem::path> SuppliedRoot;
   if (Params.rootUri && *Params.rootUri)
-    Root.path = Params.rootUri->file().str();
+    SuppliedRoot = Params.rootUri->file().str();
   else if (Params.rootPath && !Params.rootPath->empty())
-    Root.path = *Params.rootPath;
+    SuppliedRoot = *Params.rootPath;
 
+  if (!SuppliedRoot)
+    return;
+
+  std::error_code EC;
+  const std::filesystem::file_status Status =
+      std::filesystem::status(*SuppliedRoot, EC);
+  std::string Reason;
+  if (EC)
+    Reason = EC.message();
+  else if (!std::filesystem::exists(Status))
+    Reason = "path does not exist";
+  else if (!std::filesystem::is_directory(Status))
+    Reason = "path is not a directory";
+  else if (access(SuppliedRoot->c_str(), X_OK) != 0)
+    Reason = std::error_code(errno, std::generic_category()).message();
+
+  if (Reason.empty()) {
+    Root.path = std::move(*SuppliedRoot);
+    return;
+  }
+
+  std::string Message = llvm::formatv(
+      "unusable workspace root {0}: {1}; using launch directory {2}",
+      SuppliedRoot->string(), Reason, LaunchDirectory.string());
+  lspserver::elog("{0}", Message);
+  PendingStartupWarning = ShowMessageParams{
+      .type = MessageType::Warning,
+      .message = std::move(Message),
+  };
+  Root.path = LaunchDirectory;
+  SkipProjectConfig = true;
+}
+
+void Controller::selectBaseConfig() {
   CommandLineConfiguration CLI = parseCLIConfig();
   ProjectConfigError.reset();
   if (CLI.config) {
     BaseConfig = *CLI.config;
-  } else if (CLI.enableProjectConfig) {
+  } else if (CLI.enableProjectConfig && !SkipProjectConfig) {
     ProjectConfigLoadResult Loaded = loadProjectConfig(Root.path.string());
     ProjectConfigError = std::move(Loaded.error);
+    if (ProjectConfigError) {
+      std::string Message = llvm::formatv(
+          "failed to load project configuration at {0}: {1}",
+          ProjectConfigError->path, ProjectConfigError->message);
+      lspserver::elog("{0}", Message);
+      PendingStartupWarning = ShowMessageParams{
+          .type = MessageType::Warning,
+          .message = std::move(Message),
+      };
+    }
     BaseConfig = Loaded.config.value_or(builtinConfig());
   } else {
     BaseConfig = builtinConfig();
@@ -200,17 +247,19 @@ void Controller::
 
   ClientCaps = Params.capabilities;
 
+  selectWorkspaceRoot(Params);
+
   // Start default workers.
-  startNixpkgs(NixpkgsEval);
+  startNixpkgs(NixpkgsEval, Root.path);
 
   // Create the default worker now; updateConfig() selects and evaluates its
   // active configuration after all source precedence has been resolved.
   {
     std::lock_guard _(OptionsLock);
-    startOption("nixos", Options["nixos"]);
+    startOption("nixos", Options["nixos"], Root.path);
   }
   try {
-    selectBaseConfig(Params);
+    selectBaseConfig();
   } catch (LLVMErrorException &Err) {
     lspserver::elog("parse CLI config error: {0}, {1}", Err.what(),
                     Err.takeError());
@@ -219,7 +268,12 @@ void Controller::
   fetchConfig();
 }
 
-void Controller::onInitialized(const lspserver::InitializedParams &Params) {}
+void Controller::onInitialized(const lspserver::InitializedParams &Params) {
+  if (!PendingStartupWarning)
+    return;
+  ShowMessage(*PendingStartupWarning);
+  PendingStartupWarning.reset();
+}
 
 void Controller::onShutdown(const lspserver::NoParams &,
                             lspserver::Callback<std::nullptr_t> Reply) {

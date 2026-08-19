@@ -10,10 +10,15 @@
 #include "nixd/Support/ForkPiped.h"
 
 #include <boost/asio/post.hpp>
+#include <signal.h>
 #include <sys/wait.h>
 
 using namespace nixd;
 using namespace lspserver;
+
+namespace {
+constexpr int FormatterChdirFailureSignal = SIGUSR2;
+}
 
 void Controller::onFormat(const DocumentFormattingParams &Params,
                           Callback<std::vector<TextEdit>> Reply) {
@@ -47,9 +52,14 @@ void Controller::onFormat(const DocumentFormattingParams &Params,
     int In;
     int Out;
     int Err;
+    const std::filesystem::path RootPath = Root.path;
 
     pid_t Child = forkPiped(In, Out, Err);
     if (Child == 0) {
+      if (chdir(RootPath.c_str()) != 0) {
+        kill(getpid(), FormatterChdirFailureSignal);
+        _exit(-1);
+      }
       execvp(Syscall[0], Syscall.data());
       exit(-1);
     }
@@ -69,6 +79,13 @@ void Controller::onFormat(const DocumentFormattingParams &Params,
     // And, wait for the process.
     int Exit = 0;
     waitpid(Child, &Exit, 0);
+
+    if (WIFSIGNALED(Exit) &&
+        WTERMSIG(Exit) == FormatterChdirFailureSignal) {
+      Reply(error("failed to change formatter working directory to {0}",
+                  RootPath.string()));
+      return;
+    }
 
     if (Exit != 0) {
       Reply(error("formatting {0} command exited with {1}", FormatCommand[0],

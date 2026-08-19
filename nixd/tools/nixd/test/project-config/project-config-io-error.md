@@ -1,6 +1,7 @@
-# RUN: mkdir %t-root && touch %t-root/.nixd.json && chmod 000 %t-root && sed 's|ROOT|%t-root|g' %s > %t-input && nixd --enable-project-config --lit-test < %t-input | FileCheck %s && chmod 700 %t-root && rm -rf %t-root
+# RUN: python3 %S/project-config-io-error.py %s %t-root | FileCheck %s
 
-This creates an existing unreadable project configuration path. Initialization
+This creates an accessible workspace with an existing unreadable project
+configuration file. Initialization
 must retain the built-in configuration after recording a structured I/O error;
 it must not let filesystem status exceptions escape.
 

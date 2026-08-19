@@ -198,7 +198,7 @@ void Controller::updateConfig(Configuration NewConfig) {
       auto &Client = Options[Name];
       if (!Client) {
         // If it does not exist. Launch a new client.
-        startOption(Name, Client);
+        startOption(Name, Client, Root.path);
       }
       assert(Client);
       if (AttrSetClient *Worker = Client->client())

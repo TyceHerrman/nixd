@@ -69,7 +69,8 @@ void Controller::createWorkDoneProgress(
 Controller::Controller(std::unique_ptr<lspserver::InboundPort> In,
                        std::unique_ptr<lspserver::OutboundPort> Out)
     : LSPServer(std::move(In), std::move(Out)) {
-  Root.path = std::filesystem::current_path();
+  LaunchDirectory = std::filesystem::current_path();
+  Root.path = LaunchDirectory;
 
   // Life Cycle
   Registry.addMethod("initialize", this, &Controller::onInitialize);
@@ -125,6 +126,7 @@ Controller::Controller(std::unique_ptr<lspserver::InboundPort> In,
 
   PublishDiagnostic = mkOutNotifiction<PublishDiagnosticsParams>(
       "textDocument/publishDiagnostics");
+  ShowMessage = mkOutNotifiction<ShowMessageParams>("window/showMessage");
   CreateWorkDoneProgress =
       mkOutMethod<WorkDoneProgressCreateParams, std::nullptr_t>(
           "window/workDoneProgress/create");
