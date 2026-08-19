@@ -5,6 +5,17 @@
 Implemented on branch `project-config` from accepted Task 2 HEAD
 `cdd0f456fcb077d64144455824fd391338c3e8d4`.
 
+## Review round 1 follow-up
+
+Review found that the format-field explanation conflated complete-base
+defaulting with editor-overlay preservation, and that an earlier sentence
+could still imply that the options map is merged. The documentation now states
+separately that a complete project/CLI `formatting` object without `command`
+uses the C++ `["nixfmt"]` default, while an editor overlay that omits
+`formatting.command` preserves the selected base formatter. The early options
+guidance now says to configure the named options map without merge-like
+"extend" wording.
+
 ## Documentation changes
 
 - Replaced the obsolete statement that nixd does not read `.nixd.json` with a
@@ -79,7 +90,7 @@ Focused real-server project-configuration suite:
 XDG_CACHE_HOME=/private/tmp/codex-nixd-cache MESON_BUILD_ROOT=$PWD/build/nixd/tools NIXD_ATTRSET_EVAL=$PWD/build/nixd/tools/nixd-attrset-eval PATH=$PWD/build/nixd/tools:$PATH nix develop --command lit -vv nixd/tools/nixd/test/project-config
 ```
 
-Result: 24/24 passed, 0 failed, in 8.15 seconds.
+Result: 24/24 passed, 0 failed, in 13.28 seconds.
 
 Compile:
 
@@ -96,7 +107,7 @@ Focused nixd regression:
 XDG_CACHE_HOME=/private/tmp/codex-nixd-cache nix develop --command meson test -C build regression/nixd
 ```
 
-Result: 1/1 passed, `Fail: 0`, in 26.00 seconds.
+Result: 1/1 passed, `Fail: 0`, in 51.23 seconds.
 
 Full Meson suite:
 
@@ -105,7 +116,7 @@ XDG_CACHE_HOME=/private/tmp/codex-nixd-cache nix develop --command meson test -C
 ```
 
 Result: 6/6 passed, `Fail: 0`; the longest test was `regression/nixd` at
-26.31 seconds.
+52.71 seconds.
 
 `git diff --check` exited 0.
 
@@ -119,9 +130,10 @@ Result: 6/6 passed, `Fail: 0`; the longest test was `regression/nixd` at
   lifecycle implementation, CLI help, fixtures, and real-server tests.
 - Confirmed `$schema` in the example is accepted by root
   `additionalProperties: true` and matches the schema's public `$id`.
-- Confirmed formatting accepts the parser's direct string shorthand and object
-  command array, including the C++ default when the object or command is
-  omitted.
+- The initial format-field wording did not distinguish complete-base defaulting
+  from editor-overlay preservation. Review round 1 identified that ambiguity;
+  the corrected overview and field explanation now state both behaviors
+  explicitly while retaining the parser's string shorthand and command array.
 - Confirmed each fixed nested object permits unvisited keys, while arbitrary
   `options` values must still be provider objects with any supplied `expr`
   typed as a string.
@@ -135,7 +147,9 @@ Result: 6/6 passed, `Fail: 0`; the longest test was `regression/nixd` at
 
 ## Concerns
 
-No runtime or documentation semantic ambiguity remains. The development
-environment does not include a JSON-Schema meta-validator; syntax, schema
-structure, parser alignment, and executable runtime behavior were validated
-without adding a task-only dependency.
+Review round 1 found and resolved a documentation-only ambiguity between base
+defaulting and overlay preservation, plus one remaining merge-like options
+phrase. No runtime behavior changed. The development environment does not
+include a JSON-Schema meta-validator; syntax, schema structure, parser
+alignment, and executable runtime behavior were validated without adding a
+task-only dependency.

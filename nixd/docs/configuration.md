@@ -26,8 +26,9 @@ If you do not config anything in nixd, here are the defaults (suitable for most 
 * nixpkgs packages comes from `import <nixpkgs> { }`
 * nixos options, evaluated from `<nixpkgs>`
 
-For advanced users, e.g. having many custom modules, or want to extend anyother options system,
-"options" field must be extended in the settings, to tell nixd how to get the modules. tldr:
+For advanced users with custom modules or another options system, configure the
+named `options` map in the settings to tell nixd how to get the modules. Typical
+cases include:
 
 * custom module system (home-manager, nix-darwin, flake-parts, ...)
 * custom nixpkgs path, input from your "system" flake
@@ -216,7 +217,10 @@ You can also set the `eglot-workspace-configuration` variable globally (by using
 
 > [!NOTE]
 > This annotated JSON is an editor configuration and belongs under the `nixd`
-> key. Project files and `--config` use the unwrapped object instead.
+> key. Project files and `--config` use the unwrapped object instead. In a
+> complete project/CLI base, a `formatting` object without `command` uses the
+> C++ default `["nixfmt"]`. In this editor overlay, omitting
+> `formatting.command` preserves the formatter selected by the base.
 
 ```jsonc
 {
@@ -300,7 +304,9 @@ prefer to suppress diagnostics altogether. This can be achieved by utilizing the
 
 To configure the external command and arguments used for formatting, change the
 `formatting` section. A direct string is shorthand for a one-element command
-array; an object without `command` retains the default `["nixfmt"]`.
+array. In a complete project/CLI base, an object without `command` uses the C++
+default `["nixfmt"]`; in an editor overlay, an omitted `command` preserves the
+selected base formatter.
 
 ```jsonc
 {
