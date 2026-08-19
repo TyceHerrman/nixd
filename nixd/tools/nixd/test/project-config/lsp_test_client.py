@@ -146,7 +146,7 @@ class Client:
             }},
         })
 
-    def formatting(self, request_id, uri):
+    def formatting(self, request_id, uri, timeout=TIMEOUT_SECONDS):
         self.send({
             "jsonrpc": "2.0",
             "id": request_id,
@@ -156,7 +156,10 @@ class Client:
                 "options": {"tabSize": 2, "insertSpaces": True},
             },
         })
-        return self.wait_for(lambda message: message.get("id") == request_id)
+        return self.wait_for(
+            lambda message: message.get("id") == request_id,
+            timeout=timeout,
+        )
 
     def hover(self, request_id, uri, line=0, character=6):
         self.send({

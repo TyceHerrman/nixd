@@ -12,9 +12,9 @@
 
 #include <boost/asio/thread_pool.hpp>
 
+#include <cstdint>
 #include <filesystem>
 #include <set>
-#include <shared_mutex>
 
 namespace nixd {
 
@@ -28,17 +28,14 @@ private:
   // Use this worker for evaluating nixpkgs.
   std::unique_ptr<AttrSetClientProc> NixpkgsEval;
 
-  std::shared_mutex NixpkgsLock;
-  bool ActiveNixpkgs = false; // GUARDED_BY(NixpkgsLock)
+  std::mutex NixpkgsStateLock;
+  bool ActiveNixpkgs = false;          // GUARDED_BY(NixpkgsStateLock)
+  std::uint64_t NixpkgsGeneration = 0; // GUARDED_BY(NixpkgsStateLock)
+  std::string NixpkgsExpr;             // GUARDED_BY(NixpkgsStateLock)
 
-  class NixpkgsClientGuard {
-    std::shared_lock<std::shared_mutex> Lock;
+  struct NixpkgsClientToken {
     AttrSetClient *Client;
-
-  public:
-    NixpkgsClientGuard(std::shared_lock<std::shared_mutex> Lock,
-                       AttrSetClient *Client)
-        : Lock(std::move(Lock)), Client(Client) {}
+    std::uint64_t Generation;
 
     AttrSetClient *get() const { return Client; }
   };
@@ -56,10 +53,16 @@ private:
     return *NixpkgsEval;
   }
 
-  NixpkgsClientGuard acquireNixpkgsClient() {
-    std::shared_lock Guard(NixpkgsLock);
+  NixpkgsClientToken acquireNixpkgsClient() {
+    std::lock_guard Guard(NixpkgsStateLock);
     AttrSetClient *Client = ActiveNixpkgs ? nixpkgsEval().client() : nullptr;
-    return {std::move(Guard), Client};
+    return {Client, NixpkgsGeneration};
+  }
+
+  bool isNixpkgsCurrent(const NixpkgsClientToken &Token) {
+    std::lock_guard Guard(NixpkgsStateLock);
+    return Token.Client && ActiveNixpkgs &&
+           Token.Generation == NixpkgsGeneration;
   }
 
   void evalExprWithProgress(AttrSetClient &Client, const EvalExprParams &Params,

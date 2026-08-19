@@ -137,6 +137,8 @@ void Controller::onInlayHint(const InlayHintsParams &Params,
                                    *TU->parentMap(), Range, Response,
                                    TU->src());
       NP.dfs(AST.get());
+      if (!isNixpkgsCurrent(Nixpkgs))
+        return std::vector<InlayHint>{};
       return Response;
     }());
   };

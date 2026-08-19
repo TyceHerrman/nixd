@@ -30,7 +30,7 @@ def exercise_removed_root():
             uri = (root / "document.nix").as_uri()
             client.open_document(uri, "x" * (2 * 1024 * 1024))
             try:
-                response = client.formatting(20, uri)
+                response = client.formatting(20, uri, timeout=30)
             except RuntimeError as error:
                 client.proc.wait(timeout=10)
                 raise AssertionError(

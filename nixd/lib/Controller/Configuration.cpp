@@ -176,13 +176,18 @@ void Controller::updateConfig(Configuration NewConfig) {
   }
 
   {
-    std::unique_lock Guard(NixpkgsLock);
-    ActiveNixpkgs = !NewConfig.nixpkgs.expr.empty();
-    /// Evaluate nixpkgs and options, using user-provided config.
-    if (ActiveNixpkgs)
-      if (AttrSetClient *Client = nixpkgsEval().client())
-        evalExprWithProgress(*Client, NewConfig.nixpkgs.expr,
-                             "nixpkgs entries");
+    std::lock_guard Guard(NixpkgsStateLock);
+    if (NixpkgsExpr != NewConfig.nixpkgs.expr) {
+      const bool NewActiveNixpkgs = !NewConfig.nixpkgs.expr.empty();
+      /// Enqueue evaluation before publishing the new visible generation.
+      if (NewActiveNixpkgs)
+        if (AttrSetClient *Client = nixpkgsEval().client())
+          evalExprWithProgress(*Client, NewConfig.nixpkgs.expr,
+                               "nixpkgs entries");
+      NixpkgsExpr = NewConfig.nixpkgs.expr;
+      ActiveNixpkgs = NewActiveNixpkgs;
+      ++NixpkgsGeneration;
+    }
   }
   {
     std::lock_guard _(OptionsLock);

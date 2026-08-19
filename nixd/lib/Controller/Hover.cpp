@@ -228,7 +228,8 @@ void Controller::onHover(const TextDocumentPositionParams &Params,
         if (auto *Client = Nixpkgs.get()) {
           const auto &Var = static_cast<const ExprVar &>(UpExpr);
           if (auto H = hoverVar(Var, VLA, PM, *Client, TU->src()))
-            return *H;
+            if (isNixpkgsCurrent(Nixpkgs))
+              return *H;
         }
         break;
       }
@@ -237,7 +238,8 @@ void Controller::onHover(const TextDocumentPositionParams &Params,
         if (auto *Client = Nixpkgs.get()) {
           const auto &Sel = static_cast<const ExprSelect &>(UpExpr);
           if (auto H = hoverSelect(Sel, VLA, PM, *Client, TU->src()))
-            return *H;
+            if (isNixpkgsCurrent(Nixpkgs))
+              return *H;
         }
         break;
       }

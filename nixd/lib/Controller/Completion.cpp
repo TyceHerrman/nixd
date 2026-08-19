@@ -397,7 +397,8 @@ AttrPathCompleteParams mkParams(nixd::Selector Sel, bool IsComplete) {
 void completeVarName(const lspserver::Range EditRange,
                      const VariableLookupAnalysis &VLA,
                      const ParentMapAnalysis &PM, const nixf::ExprVar &N,
-                     AttrSetClient *Client, std::vector<CompletionItem> &List) {
+                     AttrSetClient *Client, std::vector<CompletionItem> &List,
+                     std::vector<CompletionItem> &NixpkgsItems) {
 #define DBGPREFIX "completion/var"
 
   VLACompletionProvider VLAP(VLA);
@@ -417,7 +418,8 @@ void completeVarName(const lspserver::Range EditRange,
     // Invoke nixpkgs provider to get the completion list.
     NixpkgsCompletionProvider NCP(*Client);
     // Variable names are always incomplete.
-    NCP.completePackages(EditRange, mkParams(Sel, /*IsComplete=*/false), List);
+    NCP.completePackages(EditRange, mkParams(Sel, /*IsComplete=*/false),
+                         NixpkgsItems);
   } catch (ExceedSizeError &) {
     // Let "onCompletion" catch this exception to set "inComplete" field.
     throw;
@@ -504,9 +506,19 @@ void Controller::onCompletion(const CompletionParams &Params,
           // In these cases, assume the cursor have "variable" scoping.
           case Node::NK_ExprVar: {
             auto Nixpkgs = acquireNixpkgsClient();
-            completeVarName(EditRange, VLA, PM,
-                            static_cast<const nixf::ExprVar &>(UpExpr),
-                            Nixpkgs.get(), List.items);
+            std::vector<CompletionItem> NixpkgsItems;
+            try {
+              completeVarName(EditRange, VLA, PM,
+                              static_cast<const nixf::ExprVar &>(UpExpr),
+                              Nixpkgs.get(), List.items, NixpkgsItems);
+            } catch (ExceedSizeError &) {
+              if (isNixpkgsCurrent(Nixpkgs))
+                throw;
+              return List;
+            }
+            if (isNixpkgsCurrent(Nixpkgs))
+              for (auto &Item : NixpkgsItems)
+                addItem(List.items, std::move(Item));
             return List;
           }
           // A "select" expression. e.g.
@@ -515,9 +527,19 @@ void Controller::onCompletion(const CompletionParams &Params,
           // foo.a.bar|
           case Node::NK_ExprSelect: {
             auto Nixpkgs = acquireNixpkgsClient();
+            std::vector<CompletionItem> NixpkgsItems;
             const auto &Select = static_cast<const nixf::ExprSelect &>(UpExpr);
-            completeSelect(EditRange, Select, Nixpkgs.get(), VLA, PM,
-                           N.kind() == Node::NK_Dot, List.items);
+            try {
+              completeSelect(EditRange, Select, Nixpkgs.get(), VLA, PM,
+                             N.kind() == Node::NK_Dot, NixpkgsItems);
+            } catch (ExceedSizeError &) {
+              if (isNixpkgsCurrent(Nixpkgs))
+                throw;
+              return List;
+            }
+            if (isNixpkgsCurrent(Nixpkgs))
+              for (auto &Item : NixpkgsItems)
+                addItem(List.items, std::move(Item));
             return List;
           }
           case Node::NK_ExprAttrs: {
@@ -563,6 +585,8 @@ void Controller::onCompletionItemResolve(const CompletionItem &Params,
     if (AttrSetClient *Client = Nixpkgs.get()) {
       NixpkgsCompletionProvider NCP(*Client);
       NCP.resolvePackage(Req.Scope, Params.label, Resp);
+      if (!isNixpkgsCurrent(Nixpkgs))
+        Resp = Params;
     }
 
     Reply(std::move(Resp));
