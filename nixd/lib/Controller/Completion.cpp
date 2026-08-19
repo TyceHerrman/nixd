@@ -48,6 +48,30 @@ void addItem(std::vector<CompletionItem> &Items, CompletionItem Item) {
   Items.emplace_back(std::move(Item));
 }
 
+struct CompletionItems {
+  std::vector<CompletionItem> Items;
+  bool IsIncomplete = false;
+};
+
+void addItem(CompletionItems &Result, CompletionItem Item) {
+  if (Result.Items.size() >= MaxCompletionSize) {
+    Result.IsIncomplete = true;
+    return;
+  }
+  Result.Items.emplace_back(std::move(Item));
+}
+
+void mergeItems(CompletionList &List, CompletionItems Result) {
+  List.isIncomplete |= Result.IsIncomplete;
+  for (auto &Item : Result.Items) {
+    if (List.items.size() >= MaxCompletionSize) {
+      List.isIncomplete = true;
+      return;
+    }
+    List.items.emplace_back(std::move(Item));
+  }
+}
+
 bool hasConcreteChild(const Node &N) {
   for (const Node *Child : N.children()) {
     if (Child)
@@ -73,7 +97,7 @@ class VLACompletionProvider {
   }
 
   /// Collect definition on some env, and also it's ancestors.
-  void collectDef(std::vector<CompletionItem> &Items, const EnvNode *Env,
+  void collectDef(CompletionItems &Items, const EnvNode *Env,
                   const std::string &Prefix) {
     if (!Env)
       return;
@@ -96,7 +120,7 @@ public:
   VLACompletionProvider(const VariableLookupAnalysis &VLA) : VLA(VLA) {}
 
   /// Perform code completion right after this node.
-  void complete(const nixf::ExprVar &Desc, std::vector<CompletionItem> &Items,
+  void complete(const nixf::ExprVar &Desc, CompletionItems &Items,
                 const ParentMapAnalysis &PM) {
     std::string Prefix = Desc.id().name();
     collectDef(Items, upEnv(Desc, VLA, PM), Prefix);
@@ -143,7 +167,7 @@ public:
   /// \brief Ask nixpkgs provider, give us a list of names. (thunks)
   void completePackages(const lspserver::Range EditRange,
                         const AttrPathCompleteParams &Params,
-                        std::vector<CompletionItem> &Items) {
+                        CompletionItems &Items) {
     std::binary_semaphore Ready(0);
     std::vector<std::string> Names;
     auto OnReply = [&Ready,
@@ -397,12 +421,12 @@ AttrPathCompleteParams mkParams(nixd::Selector Sel, bool IsComplete) {
 void completeVarName(const lspserver::Range EditRange,
                      const VariableLookupAnalysis &VLA,
                      const ParentMapAnalysis &PM, const nixf::ExprVar &N,
-                     AttrSetClient *Client, std::vector<CompletionItem> &List,
-                     std::vector<CompletionItem> &NixpkgsItems) {
+                     AttrSetClient *Client, CompletionItems &StaticItems,
+                     CompletionItems &NixpkgsItems) {
 #define DBGPREFIX "completion/var"
 
   VLACompletionProvider VLAP(VLA);
-  VLAP.complete(N, List, PM);
+  VLAP.complete(N, StaticItems, PM);
 
   if (!Client)
     return;
@@ -420,9 +444,6 @@ void completeVarName(const lspserver::Range EditRange,
     // Variable names are always incomplete.
     NCP.completePackages(EditRange, mkParams(Sel, /*IsComplete=*/false),
                          NixpkgsItems);
-  } catch (ExceedSizeError &) {
-    // Let "onCompletion" catch this exception to set "inComplete" field.
-    throw;
   } catch (std::exception &E) {
     return log(DBG "skipped, reason: {0}", E.what());
   }
@@ -440,7 +461,7 @@ void completeSelect(const lspserver::Range EditRange,
                     const nixf::ExprSelect &Select, AttrSetClient *Client,
                     const nixf::VariableLookupAnalysis &VLA,
                     const nixf::ParentMapAnalysis &PM, bool IsComplete,
-                    std::vector<CompletionItem> &List) {
+                    CompletionItems &Items) {
 #define DBGPREFIX "completion/select"
   if (!Client)
     return;
@@ -462,10 +483,7 @@ void completeSelect(const lspserver::Range EditRange,
   try {
     Selector Sel =
         idioms::mkSelector(Select, idioms::mkVarSelector(Var, VLA, PM));
-    NCP.completePackages(EditRange, mkParams(Sel, IsComplete), List);
-  } catch (ExceedSizeError &) {
-    // Let "onCompletion" catch this exception to set "inComplete" field.
-    throw;
+    NCP.completePackages(EditRange, mkParams(Sel, IsComplete), Items);
   } catch (std::exception &E) {
     return log(DBG "skipped, reason: {0}", E.what());
   }
@@ -506,19 +524,14 @@ void Controller::onCompletion(const CompletionParams &Params,
           // In these cases, assume the cursor have "variable" scoping.
           case Node::NK_ExprVar: {
             auto Nixpkgs = acquireNixpkgsClient();
-            std::vector<CompletionItem> NixpkgsItems;
-            try {
-              completeVarName(EditRange, VLA, PM,
-                              static_cast<const nixf::ExprVar &>(UpExpr),
-                              Nixpkgs.get(), List.items, NixpkgsItems);
-            } catch (ExceedSizeError &) {
-              if (isNixpkgsCurrent(Nixpkgs))
-                throw;
-              return List;
-            }
+            CompletionItems StaticItems;
+            CompletionItems NixpkgsItems;
+            completeVarName(EditRange, VLA, PM,
+                            static_cast<const nixf::ExprVar &>(UpExpr),
+                            Nixpkgs.get(), StaticItems, NixpkgsItems);
+            mergeItems(List, std::move(StaticItems));
             if (isNixpkgsCurrent(Nixpkgs))
-              for (auto &Item : NixpkgsItems)
-                addItem(List.items, std::move(Item));
+              mergeItems(List, std::move(NixpkgsItems));
             return List;
           }
           // A "select" expression. e.g.
@@ -527,19 +540,12 @@ void Controller::onCompletion(const CompletionParams &Params,
           // foo.a.bar|
           case Node::NK_ExprSelect: {
             auto Nixpkgs = acquireNixpkgsClient();
-            std::vector<CompletionItem> NixpkgsItems;
+            CompletionItems NixpkgsItems;
             const auto &Select = static_cast<const nixf::ExprSelect &>(UpExpr);
-            try {
-              completeSelect(EditRange, Select, Nixpkgs.get(), VLA, PM,
-                             N.kind() == Node::NK_Dot, NixpkgsItems);
-            } catch (ExceedSizeError &) {
-              if (isNixpkgsCurrent(Nixpkgs))
-                throw;
-              return List;
-            }
+            completeSelect(EditRange, Select, Nixpkgs.get(), VLA, PM,
+                           N.kind() == Node::NK_Dot, NixpkgsItems);
             if (isNixpkgsCurrent(Nixpkgs))
-              for (auto &Item : NixpkgsItems)
-                addItem(List.items, std::move(Item));
+              mergeItems(List, std::move(NixpkgsItems));
             return List;
           }
           case Node::NK_ExprAttrs: {
