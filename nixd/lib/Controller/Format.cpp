@@ -12,6 +12,7 @@
 
 #include <boost/asio/post.hpp>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -87,7 +88,153 @@ ssize_t writeWithoutSigpipe(int FD, const void *Buffer, size_t Size) {
   errno = WriteError;
   return Result;
 }
+
+std::error_code setNonBlocking(int FD) {
+  int Flags;
+  do {
+    Flags = fcntl(FD, F_GETFL);
+  } while (Flags == -1 && errno == EINTR);
+  if (Flags == -1)
+    return std::error_code(errno, std::generic_category());
+
+  int Result;
+  do {
+    Result = fcntl(FD, F_SETFL, Flags | O_NONBLOCK);
+  } while (Result == -1 && errno == EINTR);
+  if (Result == -1)
+    return std::error_code(errno, std::generic_category());
+  return {};
 }
+
+struct FormatterIOResult {
+  std::string Response;
+  std::error_code ConfigurationError;
+  std::error_code WriteError;
+  std::error_code ReadError;
+  std::error_code StderrReadError;
+  std::error_code PollError;
+};
+
+void drainFormatterFD(util::AutoCloseFD &FD, std::string *Output,
+                      std::error_code &Error) {
+  while (!FD.isReleased()) {
+    char Buffer[8192];
+    const ssize_t Read = read(FD.get(), Buffer, sizeof(Buffer));
+    if (Read > 0) {
+      if (Output)
+        Output->append(Buffer, Read);
+      return;
+    }
+    if (Read == 0) {
+      closeFD(FD);
+      return;
+    }
+    if (errno == EINTR)
+      continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK)
+      return;
+    Error = std::error_code(errno, std::generic_category());
+    closeFD(FD);
+  }
+}
+
+FormatterIOResult pumpFormatter(const std::string &Code,
+                                util::AutoCloseFD &Input,
+                                util::AutoCloseFD &Output,
+                                util::AutoCloseFD &Error, bool SendInput) {
+  FormatterIOResult Result;
+
+  for (int FD : {Input.get(), Output.get(), Error.get()}) {
+    if (std::error_code EC = setNonBlocking(FD)) {
+      Result.ConfigurationError = EC;
+      closeFD(Input);
+      closeFD(Output);
+      closeFD(Error);
+      return Result;
+    }
+  }
+
+  const char *InputPosition = Code.data();
+  const char *InputEnd = Code.data() + Code.size();
+  if (!SendInput || InputPosition == InputEnd)
+    closeFD(Input);
+
+  while (!Input.isReleased() || !Output.isReleased() || !Error.isReleased()) {
+    pollfd PollFDs[3];
+    nfds_t Count = 0;
+    int InputIndex = -1;
+    int OutputIndex = -1;
+    int ErrorIndex = -1;
+
+    if (!Input.isReleased()) {
+      InputIndex = Count;
+      PollFDs[Count++] = {Input.get(), POLLOUT, 0};
+    }
+    if (!Output.isReleased()) {
+      OutputIndex = Count;
+      PollFDs[Count++] = {Output.get(), POLLIN, 0};
+    }
+    if (!Error.isReleased()) {
+      ErrorIndex = Count;
+      PollFDs[Count++] = {Error.get(), POLLIN, 0};
+    }
+
+    int PollResult;
+    do {
+      PollResult = poll(PollFDs, Count, -1);
+    } while (PollResult == -1 && errno == EINTR);
+    if (PollResult == -1) {
+      Result.PollError = std::error_code(errno, std::generic_category());
+      closeFD(Input);
+      closeFD(Output);
+      closeFD(Error);
+      break;
+    }
+
+    auto Drain = [&](int Index, util::AutoCloseFD &FD, std::string *Contents,
+                     std::error_code &ReadError) {
+      if (Index == -1)
+        return;
+      const short Events = PollFDs[Index].revents;
+      if (Events & POLLNVAL) {
+        ReadError = std::error_code(EBADF, std::generic_category());
+        closeFD(FD);
+        return;
+      }
+      if (Events & (POLLIN | POLLHUP | POLLERR))
+        drainFormatterFD(FD, Contents, ReadError);
+    };
+
+    Drain(OutputIndex, Output, &Result.Response, Result.ReadError);
+    Drain(ErrorIndex, Error, nullptr, Result.StderrReadError);
+
+    if (InputIndex == -1)
+      continue;
+    const short InputEvents = PollFDs[InputIndex].revents;
+    if (InputEvents & POLLNVAL) {
+      Result.WriteError = std::error_code(EBADF, std::generic_category());
+      closeFD(Input);
+      continue;
+    }
+    if (!(InputEvents & (POLLOUT | POLLHUP | POLLERR)))
+      continue;
+
+    const ssize_t Written = writeWithoutSigpipe(Input.get(), InputPosition,
+                                                InputEnd - InputPosition);
+    if (Written > 0) {
+      InputPosition += Written;
+    } else if (Written != -1 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+      Result.WriteError =
+          std::error_code(Written == 0 ? EIO : errno, std::generic_category());
+      closeFD(Input);
+    }
+    if (!Input.isReleased() && InputPosition == InputEnd)
+      closeFD(Input);
+  }
+
+  return Result;
+}
+} // namespace
 
 void Controller::onFormat(const DocumentFormattingParams &Params,
                           Callback<std::vector<TextEdit>> Reply) {
@@ -123,29 +270,26 @@ void Controller::onFormat(const DocumentFormattingParams &Params,
     int Err;
     const std::filesystem::path RootPath = Root.path;
 
-    int SetupPipe[2];
-    if (pipe(SetupPipe) == -1) {
-      Reply(error("failed to create formatter setup pipe: {0}",
-                  std::error_code(errno, std::generic_category()).message()));
-      return;
-    }
-    util::AutoCloseFD SetupRead(SetupPipe[0]);
-    util::AutoCloseFD SetupWrite(SetupPipe[1]);
-    int SetupFlags = fcntl(SetupWrite.get(), F_GETFD);
-    if (SetupFlags == -1 ||
-        fcntl(SetupWrite.get(), F_SETFD, SetupFlags | FD_CLOEXEC) == -1) {
-      Reply(error("failed to configure formatter setup pipe: {0}",
-                  std::error_code(errno, std::generic_category()).message()));
-      return;
-    }
-
+    ForkPipedExtraPipe SetupPipe;
     pid_t Child;
     try {
-      Child = forkPiped(In, Out, Err);
+      Child = forkPiped(In, Out, Err, &SetupPipe);
     } catch (const std::system_error &Error) {
+      if (SetupPipe.Failure == ForkPipedExtraPipeFailure::Create) {
+        Reply(error("failed to create formatter setup pipe: {0}",
+                    Error.code().message()));
+        return;
+      }
+      if (SetupPipe.Failure == ForkPipedExtraPipeFailure::Configure) {
+        Reply(error("failed to configure formatter setup pipe: {0}",
+                    Error.code().message()));
+        return;
+      }
       Reply(error("failed to launch formatter: {0}", Error.what()));
       return;
     }
+    util::AutoCloseFD SetupRead(SetupPipe.Read);
+    util::AutoCloseFD SetupWrite(SetupPipe.Write);
     if (Child == 0) {
       close(SetupRead.get());
       if (chdir(RootPath.c_str()) != 0) {
@@ -171,32 +315,14 @@ void Controller::onFormat(const DocumentFormattingParams &Params,
       SetupResult = read(SetupRead.get(), &SetupFailure, sizeof(SetupFailure));
     } while (SetupResult == -1 && errno == EINTR);
     const std::error_code SetupError =
-        SetupResult == -1
-            ? std::error_code(errno, std::generic_category())
-            : std::error_code();
+        SetupResult == -1 ? std::error_code(errno, std::generic_category())
+                          : std::error_code();
     closeFD(SetupRead);
 
-    // Firstly, send the document to the process stdin.
-    // Invoke POSIX write(2) to do such thing.
-    std::error_code WriteError;
-    if (SetupResult == 0) {
-      const char *Start = Code.c_str();
-      const char *End = Code.c_str() + Code.size();
-      while (Start != End) {
-        const ssize_t Written =
-            writeWithoutSigpipe(Input.get(), Start, End - Start);
-        if (Written > 0) {
-          Start += Written;
-          continue;
-        }
-        WriteError = std::error_code(Written == 0 ? EIO : errno,
-                                     std::generic_category());
-        break;
-      }
-    }
-    closeFD(Input);
+    FormatterIOResult IO =
+        pumpFormatter(Code, Input, Output, Error, SetupResult == 0);
 
-    // And, wait for the process.
+    // Reap only after closing input and draining both output pipes.
     int Exit = 0;
     std::error_code WaitError;
     if (!waitForChild(Child, Exit, WaitError)) {
@@ -204,8 +330,7 @@ void Controller::onFormat(const DocumentFormattingParams &Params,
       return;
     }
 
-    if (WIFSIGNALED(Exit) &&
-        WTERMSIG(Exit) == FormatterChdirFailureSignal) {
+    if (WIFSIGNALED(Exit) && WTERMSIG(Exit) == FormatterChdirFailureSignal) {
       Reply(error("failed to change formatter working directory to {0}",
                   RootPath.string()));
       return;
@@ -222,9 +347,15 @@ void Controller::onFormat(const DocumentFormattingParams &Params,
       return;
     }
 
-    if (WriteError) {
+    if (IO.ConfigurationError) {
+      Reply(error("failed to configure formatter pipes: {0}",
+                  IO.ConfigurationError.message()));
+      return;
+    }
+
+    if (IO.WriteError) {
       Reply(error("failed to write formatter input: {0}",
-                  WriteError.message()));
+                  IO.WriteError.message()));
       return;
     }
 
@@ -234,30 +365,30 @@ void Controller::onFormat(const DocumentFormattingParams &Params,
       return;
     }
 
-    // Okay, read stdout from it.
-    std::string Response;
-    while (true) {
-      char Buf[1024];
-      auto Read = read(Output.get(), Buf, sizeof(Buf));
-      if (Read == 0)
-        break;
-      if (Read < 0) {
-        if (errno == EINTR)
-          continue;
-        Reply(error("failed to read formatter output: {0}",
-                    std::error_code(errno, std::generic_category()).message()));
-        return;
-      }
-      // Otherwise, append it to "response"
-      Response.append(Buf, Read);
+    if (IO.ReadError) {
+      Reply(error("failed to read formatter output: {0}",
+                  IO.ReadError.message()));
+      return;
     }
 
-    if (Response == Code) {
+    if (IO.StderrReadError) {
+      Reply(error("failed to read formatter error output: {0}",
+                  IO.StderrReadError.message()));
+      return;
+    }
+
+    if (IO.PollError) {
+      Reply(error("failed to communicate with formatter: {0}",
+                  IO.PollError.message()));
+      return;
+    }
+
+    if (IO.Response == Code) {
       Reply(std::vector<TextEdit>{});
       return;
     }
 
-    TextEdit E{{{0, 0}, {INT_MAX, INT_MAX}}, Response};
+    TextEdit E{{{0, 0}, {INT_MAX, INT_MAX}}, IO.Response};
     Reply(std::vector{E});
   };
 

@@ -34,9 +34,14 @@ class Client:
 
     def send(self, message):
         payload = json.dumps(message, separators=(",", ":")).encode()
-        self.proc.stdin.write(
+        frame = memoryview(
             f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
         )
+        while frame:
+            written = self.proc.stdin.write(frame)
+            if not written:
+                raise BrokenPipeError("nixd closed its protocol input")
+            frame = frame[written:]
         self.proc.stdin.flush()
 
     def receive(self, timeout=TIMEOUT_SECONDS):
