@@ -381,6 +381,12 @@ void Controller::onFormat(const DocumentFormattingParams &Params,
       return;
     }
 
+    if (IO.WriteError && IO.WriteError != std::errc::broken_pipe) {
+      Reply(error("failed to write formatter input: {0}",
+                  IO.WriteError.message()));
+      return;
+    }
+
     if (Exit != 0) {
       Reply(error("formatting {0} command exited with {1}", FormatCommand[0],
                   Exit));
