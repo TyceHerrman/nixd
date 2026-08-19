@@ -213,6 +213,94 @@ def exercise_current_provider():
             client.close()
 
 
+def exercise_truncated_static_short_circuit():
+    with tempfile.TemporaryDirectory() as root:
+        root_path = Path(root)
+        ready_path = root_path / "response-ready"
+        release_path = root_path / "release-response"
+        text = static_document(35, f"with pkgs; [ {QUERY_PREFIX} ]")
+        uri = (root_path / "truncated-static.nix").as_uri()
+        base = {
+            "formatting": {"command": ["nixfmt"]},
+            "nixpkgs": {"expr": attrset_expression(PROVIDER_PREFIX)},
+        }
+        proxy = Path(__file__).with_name("blocking-attrset-proxy.py")
+        env = os.environ.copy()
+        env["REAL_NIXD_ATTRSET_EVAL"] = env["NIXD_ATTRSET_EVAL"]
+        env["NIXD_ATTRSET_EVAL"] = str(proxy)
+        env["BLOCK_RPC_METHOD"] = "attrset/attrpathComplete"
+        env["BLOCK_READY_PATH"] = str(ready_path)
+        env["BLOCK_RELEASE_PATH"] = str(release_path)
+        client = Client(
+            args=("--config=" + json.dumps(base, separators=(",", ":")),),
+            cwd=root,
+            env=env,
+        )
+        try:
+            client.initialize(root_path=root)
+            client.initialized()
+            client.open_document(uri, text)
+            send_completion(client, 30, uri, text)
+            assert_completion(
+                wait_response(client, 30, timeout=2), EXPECTED_STATIC_LABELS, True
+            )
+            assert not ready_path.exists(), "provider RPC unexpectedly reached proxy"
+        except Exception as error:
+            release_path.write_text("release after failure\n", encoding="utf-8")
+            stderr = client.close()
+            print(f"truncated-static error: {error}", file=sys.stderr)
+            print(f"proxy reached: {ready_path.exists()}", file=sys.stderr)
+            print(f"received: {client.received}", file=sys.stderr)
+            print(f"nixd stderr: {stderr}", file=sys.stderr)
+            raise
+        else:
+            client.close()
+
+
+def exercise_exact_static_cap_queries_provider():
+    with tempfile.TemporaryDirectory() as root:
+        root_path = Path(root)
+        ready_path = root_path / "response-ready"
+        release_path = root_path / "release-response"
+        text = static_document(30, f"with pkgs; [ {QUERY_PREFIX} ]")
+        uri = (root_path / "exact-static-cap.nix").as_uri()
+        base = {
+            "formatting": {"command": ["nixfmt"]},
+            "nixpkgs": {"expr": attrset_expression(PROVIDER_PREFIX, count=1)},
+        }
+        proxy = Path(__file__).with_name("blocking-attrset-proxy.py")
+        env = os.environ.copy()
+        env["REAL_NIXD_ATTRSET_EVAL"] = env["NIXD_ATTRSET_EVAL"]
+        env["NIXD_ATTRSET_EVAL"] = str(proxy)
+        env["BLOCK_RPC_METHOD"] = "attrset/attrpathComplete"
+        env["BLOCK_READY_PATH"] = str(ready_path)
+        env["BLOCK_RELEASE_PATH"] = str(release_path)
+        client = Client(
+            args=("--config=" + json.dumps(base, separators=(",", ":")),),
+            cwd=root,
+            env=env,
+        )
+        try:
+            client.initialize(root_path=root)
+            client.initialized()
+            client.open_document(uri, text)
+            send_completion(client, 40, uri, text)
+            wait_for_path(ready_path, "exact-cap provider completion request")
+            release_path.write_text("release\n", encoding="utf-8")
+            assert_completion(
+                wait_response(client, 40), EXPECTED_STATIC_LABELS, True
+            )
+        except Exception as error:
+            release_path.write_text("release after failure\n", encoding="utf-8")
+            stderr = client.close()
+            print(f"exact-static-cap error: {error}", file=sys.stderr)
+            print(f"received: {client.received}", file=sys.stderr)
+            print(f"nixd stderr: {stderr}", file=sys.stderr)
+            raise
+        else:
+            client.close()
+
+
 def exercise_stale_provider(static_count, expected_labels, incomplete):
     with tempfile.TemporaryDirectory() as root:
         root_path = Path(root)
@@ -276,13 +364,14 @@ def exercise_stale_provider(static_count, expected_labels, incomplete):
 
 def exercise_stale_provider_matrix():
     exercise_stale_provider(20, EXPECTED_STATIC_LABELS[:20], False)
-    exercise_stale_provider(35, EXPECTED_STATIC_LABELS, True)
 
 
 def main():
     cases = {
         "inactive-static": exercise_inactive_static,
         "current-provider": exercise_current_provider,
+        "truncated-static": exercise_truncated_static_short_circuit,
+        "exact-static-cap": exercise_exact_static_cap_queries_provider,
         "stale-provider": exercise_stale_provider_matrix,
     }
     selected = sys.argv[1:] or tuple(cases)

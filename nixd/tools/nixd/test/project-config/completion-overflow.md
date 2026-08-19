@@ -2,5 +2,6 @@
 
 This real-server test preserves capped completion items and independent
 incomplete flags for inactive static completion, current nixpkgs completion,
-and an oversized nixpkgs response that becomes stale while withheld by the
-transparent worker proxy.
+static-overflow short-circuiting, the exact static-cap provider boundary, and a
+nixpkgs response that becomes stale while withheld by the transparent worker
+proxy.

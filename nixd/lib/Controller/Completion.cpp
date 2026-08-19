@@ -428,7 +428,7 @@ void completeVarName(const lspserver::Range EditRange,
   VLACompletionProvider VLAP(VLA);
   VLAP.complete(N, StaticItems, PM);
 
-  if (!Client)
+  if (StaticItems.IsIncomplete || !Client)
     return;
 
   // Try to complete the name by known idioms.
