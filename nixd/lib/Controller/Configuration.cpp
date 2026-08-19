@@ -148,17 +148,21 @@ ProjectConfigLoadResult nixd::loadProjectConfig(llvm::StringRef Root) {
   try {
     return {.config = nixd::fromJSON<Configuration>(
                 nixd::parse((*Input)->getBuffer()))};
-  } catch (const JSONParseException &Err) {
+  } catch (JSONParseException &Err) {
+    const std::string Message =
+        std::string(Err.what()) + ": " + llvm::toString(Err.takeError());
     return {.error = ProjectConfigError{
                 .kind = ProjectConfigErrorKind::JSONError,
                 .path = Path,
-                .message = Err.what(),
+                .message = Message,
             }};
-  } catch (const JSONSchemaException &Err) {
+  } catch (JSONSchemaException &Err) {
+    const std::string Message =
+        std::string(Err.what()) + ": " + llvm::toString(Err.takeError());
     return {.error = ProjectConfigError{
                 .kind = ProjectConfigErrorKind::SchemaError,
                 .path = Path,
-                .message = Err.what(),
+                .message = Message,
             }};
   }
 }

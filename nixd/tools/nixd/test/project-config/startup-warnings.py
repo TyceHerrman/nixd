@@ -43,16 +43,19 @@ def exercise_invalid(kind):
         path = Path(root) / ".nixd.json"
         if kind == "io":
             path.symlink_to(path.name)
-            reason = os.strerror(errno.ELOOP)
+            reasons = (os.strerror(errno.ELOOP),)
         elif kind == "io-directory":
             path.mkdir()
-            reason = os.strerror(errno.EISDIR)
+            reasons = (os.strerror(errno.EISDIR),)
         elif kind == "json":
             path.write_text("{", encoding="utf-8")
-            reason = "JSON result cannot be parsed"
+            reasons = ("JSON result cannot be parsed", "Expected object key")
         elif kind == "schema":
             path.write_text('{"formatting":{"command":42}}', encoding="utf-8")
-            reason = "JSON schema mismatch"
+            reasons = (
+                "JSON schema mismatch",
+                "expected array at (root).formatting.command",
+            )
         else:
             raise AssertionError(f"unknown invalid kind: {kind}")
 
@@ -60,15 +63,19 @@ def exercise_invalid(kind):
         try:
             client.initialize(root_path=root)
             logged = client.read_stderr_until(
-                lambda stderr: str(path) in stderr and reason in stderr
+                lambda stderr: str(path) in stderr
+                and all(reason in stderr for reason in reasons)
             )
-            assert str(path) in logged and reason in logged
+            assert str(path) in logged
+            assert all(reason in logged for reason in reasons), logged
             client.assert_no_message(show_message)
             client.initialized()
             warning = client.wait_for(show_message)
             assert warning["params"]["type"] == 2, warning
             assert str(path) in warning["params"]["message"], warning
-            assert reason in warning["params"]["message"], warning
+            assert all(
+                reason in warning["params"]["message"] for reason in reasons
+            ), warning
             client.assert_no_message(show_message)
 
             uri = "file:///startup-warning.nix"

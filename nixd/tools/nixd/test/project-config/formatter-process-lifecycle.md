@@ -5,6 +5,7 @@
 # RUN: python3 %S/formatter-process-lifecycle.py cross-inherited-stdin-eof
 # RUN: python3 %S/formatter-process-lifecycle.py descriptor-stability
 # RUN: python3 %S/formatter-process-lifecycle.py exec-failure
+# RUN: python3 %S/formatter-process-lifecycle.py ignored-sigpipe
 
 If a selected root becomes unusable after initialization, a large formatting
 request must receive a coherent working-directory error without terminating
@@ -25,3 +26,7 @@ Repeated successful formatting under a bounded descriptor limit must remain
 stable rather than leaking two descriptors per request. An executable lookup
 failure must also return a normal formatter-command error without hanging,
 leaking descriptors, or terminating nixd.
+
+If nixd inherits SIGPIPE as ignored, an early formatter exit must still return
+an ordinary formatter-command error instead of blocking while trying to consume
+a signal that the kernel discarded.

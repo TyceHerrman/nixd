@@ -12,7 +12,15 @@ TIMEOUT_SECONDS = 10
 
 
 class Client:
-    def __init__(self, *, args=(), cwd=None, env=None, fd_limit=None):
+    def __init__(
+        self,
+        *,
+        args=(),
+        cwd=None,
+        env=None,
+        fd_limit=None,
+        restore_signals=True,
+    ):
         def limit_open_files():
             _, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
             resource.setrlimit(
@@ -29,6 +37,7 @@ class Client:
             stderr=subprocess.PIPE,
             bufsize=0,
             preexec_fn=limit_open_files if fd_limit is not None else None,
+            restore_signals=restore_signals,
         )
         self.received = []
 

@@ -378,6 +378,27 @@ def exercise_exec_failure():
             client.close()
 
 
+def exercise_ignored_sigpipe():
+    with tempfile.TemporaryDirectory() as root:
+        client = Client(
+            args=(formatter_config(["sh", "-c", "exit 125"]),),
+            cwd=root,
+            restore_signals=False,
+        )
+        try:
+            client.initialize(root_path=root)
+            client.initialized()
+            uri = (Path(root) / "document.nix").as_uri()
+            client.open_document(uri, "x" * (2 * 1024 * 1024))
+            response = client.formatting(20, uri)
+            assert response["error"]["message"].startswith(
+                "formatting sh command exited"
+            ), response
+            assert client.proc.poll() is None, client.proc.returncode
+        finally:
+            client.close()
+
+
 if __name__ == "__main__":
     case = sys.argv[1]
     if case == "removed-root":
@@ -394,6 +415,8 @@ if __name__ == "__main__":
         exercise_descriptor_stability()
     elif case == "exec-failure":
         exercise_exec_failure()
+    elif case == "ignored-sigpipe":
+        exercise_ignored_sigpipe()
     else:
         raise AssertionError(f"unknown case: {case}")
     print(f"formatter process lifecycle case passed: {case}")

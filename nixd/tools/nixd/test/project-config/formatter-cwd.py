@@ -20,10 +20,13 @@ def write_project(root, marker):
 
 
 def exercise(selector):
-    if selector == "exit-125":
+    if selector in ("exit-125", "signal-usr2"):
         with tempfile.TemporaryDirectory() as root:
+            shell_command = (
+                "exit 125" if selector == "exit-125" else "kill -USR2 $$"
+            )
             config = json.dumps({
-                "formatting": {"command": ["sh", "-c", "exit 125"]},
+                "formatting": {"command": ["sh", "-c", shell_command]},
                 "options": {},
             })
             client = Client(args=("--config=" + config,), cwd=root)

@@ -21,7 +21,6 @@ using namespace nixd;
 using namespace lspserver;
 
 namespace {
-constexpr int FormatterChdirFailureSignal = SIGUSR2;
 constexpr char FormatterChdirFailure = 'C';
 constexpr char FormatterExecFailure = 'E';
 
@@ -82,8 +81,12 @@ ssize_t writeWithoutSigpipe(int FD, const void *Buffer, size_t Size) {
   int WriteError = errno;
 
   if (Result == -1 && WriteError == EPIPE && !WasPending) {
-    int Signal = 0;
-    while ((MaskError = sigwait(&Sigpipe, &Signal)) == EINTR) {
+    sigset_t PendingAfter;
+    if (sigpending(&PendingAfter) == 0 &&
+        sigismember(&PendingAfter, SIGPIPE) == 1) {
+      int Signal = 0;
+      while ((MaskError = sigwait(&Sigpipe, &Signal)) == EINTR) {
+      }
     }
   }
 
@@ -323,7 +326,6 @@ void Controller::onFormat(const DocumentFormattingParams &Params,
       if (chdir(RootPath.c_str()) != 0) {
         reportSetupFailure(SetupWrite.get(), FormatterChdirFailure);
         close(SetupWrite.get());
-        kill(getpid(), FormatterChdirFailureSignal);
         _exit(-1);
       }
       execvp(Syscall[0], Syscall.data());
@@ -358,21 +360,22 @@ void Controller::onFormat(const DocumentFormattingParams &Params,
       return;
     }
 
-    if (WIFSIGNALED(Exit) && WTERMSIG(Exit) == FormatterChdirFailureSignal) {
-      Reply(error("failed to change formatter working directory to {0}",
-                  RootPath.string()));
-      return;
-    }
-
     if (SetupResult == -1) {
       Reply(error("failed to inspect formatter setup: {0}",
                   SetupError.message()));
       return;
     }
 
-    if (SetupResult != 0 && SetupFailure != FormatterExecFailure) {
-      Reply(error("formatter setup failed before execution"));
-      return;
+    if (SetupResult != 0) {
+      if (SetupFailure == FormatterChdirFailure) {
+        Reply(error("failed to change formatter working directory to {0}",
+                    RootPath.string()));
+        return;
+      }
+      if (SetupFailure != FormatterExecFailure) {
+        Reply(error("formatter setup failed before execution"));
+        return;
+      }
     }
 
     if (IO.ConfigurationError) {
