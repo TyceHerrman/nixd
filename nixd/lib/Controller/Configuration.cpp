@@ -134,12 +134,14 @@ ProjectConfigLoadResult nixd::loadProjectConfig(llvm::StringRef Root) {
   const std::string Path = (std::filesystem::path(Root.str()) / ".nixd.json").string();
   std::ifstream Input(Path);
   if (!Input) {
-    if (!std::filesystem::exists(Path))
+    std::error_code EC;
+    const bool Exists = std::filesystem::exists(Path, EC);
+    if (!Exists && !EC)
       return {};
     return {.error = ProjectConfigError{
                 .kind = ProjectConfigErrorKind::IOError,
                 .path = Path,
-                .message = std::strerror(errno),
+                .message = EC ? EC.message() : std::strerror(errno),
             }};
   }
 
