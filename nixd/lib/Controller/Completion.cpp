@@ -397,11 +397,14 @@ AttrPathCompleteParams mkParams(nixd::Selector Sel, bool IsComplete) {
 void completeVarName(const lspserver::Range EditRange,
                      const VariableLookupAnalysis &VLA,
                      const ParentMapAnalysis &PM, const nixf::ExprVar &N,
-                     AttrSetClient &Client, std::vector<CompletionItem> &List) {
+                     AttrSetClient *Client, std::vector<CompletionItem> &List) {
 #define DBGPREFIX "completion/var"
 
   VLACompletionProvider VLAP(VLA);
   VLAP.complete(N, List, PM);
+
+  if (!Client)
+    return;
 
   // Try to complete the name by known idioms.
   try {
@@ -412,7 +415,7 @@ void completeVarName(const lspserver::Range EditRange,
       return;
 
     // Invoke nixpkgs provider to get the completion list.
-    NixpkgsCompletionProvider NCP(Client);
+    NixpkgsCompletionProvider NCP(*Client);
     // Variable names are always incomplete.
     NCP.completePackages(EditRange, mkParams(Sel, /*IsComplete=*/false), List);
   } catch (ExceedSizeError &) {
@@ -432,11 +435,14 @@ void completeVarName(const lspserver::Range EditRange,
 ///      - incomplete: `lib.gen|`
 ///      - complete:   `lib.attrset.|`
 void completeSelect(const lspserver::Range EditRange,
-                    const nixf::ExprSelect &Select, AttrSetClient &Client,
+                    const nixf::ExprSelect &Select, AttrSetClient *Client,
                     const nixf::VariableLookupAnalysis &VLA,
                     const nixf::ParentMapAnalysis &PM, bool IsComplete,
                     std::vector<CompletionItem> &List) {
 #define DBGPREFIX "completion/select"
+  if (!Client)
+    return;
+
   // The base expr for selecting.
   const nixf::Expr &BaseExpr = Select.expr();
 
@@ -449,7 +455,7 @@ void completeSelect(const lspserver::Range EditRange,
 
   const auto &Var = static_cast<const nixf::ExprVar &>(BaseExpr);
   // Ask nixpkgs provider to get idioms completion.
-  NixpkgsCompletionProvider NCP(Client);
+  NixpkgsCompletionProvider NCP(*Client);
 
   try {
     Selector Sel =
@@ -497,9 +503,10 @@ void Controller::onCompletion(const CompletionParams &Params,
           switch (UpExpr.kind()) {
           // In these cases, assume the cursor have "variable" scoping.
           case Node::NK_ExprVar: {
+            auto Nixpkgs = acquireNixpkgsClient();
             completeVarName(EditRange, VLA, PM,
                             static_cast<const nixf::ExprVar &>(UpExpr),
-                            *nixpkgsClient(), List.items);
+                            Nixpkgs.get(), List.items);
             return List;
           }
           // A "select" expression. e.g.
@@ -507,8 +514,9 @@ void Controller::onCompletion(const CompletionParams &Params,
           // foo.|
           // foo.a.bar|
           case Node::NK_ExprSelect: {
+            auto Nixpkgs = acquireNixpkgsClient();
             const auto &Select = static_cast<const nixf::ExprSelect &>(UpExpr);
-            completeSelect(EditRange, Select, *nixpkgsClient(), VLA, PM,
+            completeSelect(EditRange, Select, Nixpkgs.get(), VLA, PM,
                            N.kind() == Node::NK_Dot, List.items);
             return List;
           }
@@ -550,10 +558,12 @@ void Controller::onCompletionItemResolve(const CompletionItem &Params,
     llvm::json::Path::Root Root;
     fromJSON(*EV, Req, Root);
 
-    // FIXME: handle null nixpkgsClient()
-    NixpkgsCompletionProvider NCP(*nixpkgsClient());
     CompletionItem Resp = Params;
-    NCP.resolvePackage(Req.Scope, Params.label, Resp);
+    auto Nixpkgs = acquireNixpkgsClient();
+    if (AttrSetClient *Client = Nixpkgs.get()) {
+      NixpkgsCompletionProvider NCP(*Client);
+      NCP.resolvePackage(Req.Scope, Params.label, Resp);
+    }
 
     Reply(std::move(Resp));
   };

@@ -2,8 +2,7 @@
 #include "nixd/Eval/Launch.h"
 #include "nixd/Support/JSON.h"
 
-#include <cstring>
-#include <fstream>
+#include <llvm/Support/MemoryBuffer.h>
 
 using namespace nixd;
 using namespace lspserver;
@@ -131,30 +130,24 @@ Configuration nixd::overlay(Configuration Base,
 }
 
 ProjectConfigLoadResult nixd::loadProjectConfig(llvm::StringRef Root) {
-  const std::string Path = (std::filesystem::path(Root.str()) / ".nixd.json").string();
-  std::ifstream Input(Path);
+  const std::string Path =
+      (std::filesystem::path(Root.str()) / ".nixd.json").string();
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> Input =
+      llvm::MemoryBuffer::getFile(Path);
   if (!Input) {
-    std::error_code EC;
-    const bool Exists = std::filesystem::exists(Path, EC);
-    if (!Exists && !EC)
+    const std::error_code EC = Input.getError();
+    if (EC == std::errc::no_such_file_or_directory)
       return {};
     return {.error = ProjectConfigError{
                 .kind = ProjectConfigErrorKind::IOError,
                 .path = Path,
-                .message = EC ? EC.message() : std::strerror(errno),
+                .message = EC.message(),
             }};
   }
 
-  std::string Contents{std::istreambuf_iterator<char>(Input), {}};
-  if (Input.bad()) {
-    return {.error = ProjectConfigError{
-                .kind = ProjectConfigErrorKind::IOError,
-                .path = Path,
-                .message = std::strerror(errno),
-            }};
-  }
   try {
-    return {.config = nixd::fromJSON<Configuration>(nixd::parse(Contents))};
+    return {.config = nixd::fromJSON<Configuration>(
+                nixd::parse((*Input)->getBuffer()))};
   } catch (const JSONParseException &Err) {
     return {.error = ProjectConfigError{
                 .kind = ProjectConfigErrorKind::JSONError,
@@ -182,12 +175,14 @@ void Controller::updateConfig(Configuration NewConfig) {
     Config = NewConfig;
   }
 
-  if (!NewConfig.nixpkgs.expr.empty()) {
+  {
+    std::unique_lock Guard(NixpkgsLock);
+    ActiveNixpkgs = !NewConfig.nixpkgs.expr.empty();
     /// Evaluate nixpkgs and options, using user-provided config.
-    if (nixpkgsClient()) {
-      evalExprWithProgress(*nixpkgsClient(), NewConfig.nixpkgs.expr,
-                           "nixpkgs entries");
-    }
+    if (ActiveNixpkgs)
+      if (AttrSetClient *Client = nixpkgsEval().client())
+        evalExprWithProgress(*Client, NewConfig.nixpkgs.expr,
+                             "nixpkgs entries");
   }
   {
     std::lock_guard _(OptionsLock);

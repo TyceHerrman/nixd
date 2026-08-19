@@ -1,5 +1,6 @@
 # RUN: python3 %S/startup-warnings.py missing
 # RUN: python3 %S/startup-warnings.py io
+# RUN: python3 %S/startup-warnings.py io-directory
 # RUN: python3 %S/startup-warnings.py json
 # RUN: python3 %S/startup-warnings.py schema
 # RUN: python3 %S/startup-warnings.py invalid-cli

@@ -222,62 +222,65 @@ void Controller::onHover(const TextDocumentPositionParams &Params,
 
       const auto &UpExpr = *CheckDefault(PM.upExpr(N));
 
-      // Try to get hover info from nixpkgs.
-      if (auto *Client = nixpkgsClient(); Client) {
-        switch (UpExpr.kind()) {
-        case Node::NK_ExprVar: {
+      switch (UpExpr.kind()) {
+      case Node::NK_ExprVar: {
+        auto Nixpkgs = acquireNixpkgsClient();
+        if (auto *Client = Nixpkgs.get()) {
           const auto &Var = static_cast<const ExprVar &>(UpExpr);
           if (auto H = hoverVar(Var, VLA, PM, *Client, TU->src()))
             return *H;
-          break;
         }
-        case Node::NK_ExprSelect: {
+        break;
+      }
+      case Node::NK_ExprSelect: {
+        auto Nixpkgs = acquireNixpkgsClient();
+        if (auto *Client = Nixpkgs.get()) {
           const auto &Sel = static_cast<const ExprSelect &>(UpExpr);
           if (auto H = hoverSelect(Sel, VLA, PM, *Client, TU->src()))
             return *H;
-          break;
         }
-        case Node::NK_ExprAttrs: {
-          // Try to get hover info from options.
-          auto Scope = std::vector<std::string>();
-          const auto R = findAttrPathForOptions(N, PM, Scope);
-          if (R == FindAttrPathResult::OK) {
-            std::lock_guard _(OptionsLock);
-            for (const auto &[Name, Client] : Options) {
-              if (!ActiveOptions.contains(Name))
-                continue;
-              if (AttrSetClient *C = Client->client()) {
-                OptionsHoverProvider OHP(*C);
-                std::optional<OptionDescription> Desc = OHP.resolveHover(Scope);
-                std::string Docs;
-                if (Desc) {
-                  if (Desc->Type) {
-                    std::string TypeName = Desc->Type->Name.value_or("");
-                    std::string TypeDesc = Desc->Type->Description.value_or("");
-                    Docs += llvm::formatv("{0} ({1})", TypeName, TypeDesc);
-                  } else {
-                    Docs += "? (missing type)";
-                  }
-                  if (Desc->Description) {
-                    Docs += "\n\n" + Desc->Description.value_or("");
-                  }
-                  return Hover{
-                      .contents =
-                          MarkupContent{
-                              .kind = MarkupKind::Markdown,
-                              .value = std::move(Docs),
-                          },
-                      .range = toLSPRange(TU->src(), N.range()),
-                  };
+        break;
+      }
+      case Node::NK_ExprAttrs: {
+        // Try to get hover info from options.
+        auto Scope = std::vector<std::string>();
+        const auto R = findAttrPathForOptions(N, PM, Scope);
+        if (R == FindAttrPathResult::OK) {
+          std::lock_guard _(OptionsLock);
+          for (const auto &[Name, Client] : Options) {
+            if (!ActiveOptions.contains(Name))
+              continue;
+            if (AttrSetClient *C = Client->client()) {
+              OptionsHoverProvider OHP(*C);
+              std::optional<OptionDescription> Desc = OHP.resolveHover(Scope);
+              std::string Docs;
+              if (Desc) {
+                if (Desc->Type) {
+                  std::string TypeName = Desc->Type->Name.value_or("");
+                  std::string TypeDesc = Desc->Type->Description.value_or("");
+                  Docs += llvm::formatv("{0} ({1})", TypeName, TypeDesc);
+                } else {
+                  Docs += "? (missing type)";
                 }
+                if (Desc->Description) {
+                  Docs += "\n\n" + Desc->Description.value_or("");
+                }
+                return Hover{
+                    .contents =
+                        MarkupContent{
+                            .kind = MarkupKind::Markdown,
+                            .value = std::move(Docs),
+                        },
+                    .range = toLSPRange(TU->src(), N.range()),
+                };
               }
             }
           }
-          break;
         }
-        default:
-          break;
-        }
+        break;
+      }
+      default:
+        break;
       }
 
       return std::nullopt;

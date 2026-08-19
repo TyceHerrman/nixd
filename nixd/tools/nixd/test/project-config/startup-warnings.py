@@ -44,6 +44,9 @@ def exercise_invalid(kind):
         if kind == "io":
             path.symlink_to(path.name)
             reason = os.strerror(errno.ELOOP)
+        elif kind == "io-directory":
+            path.mkdir()
+            reason = os.strerror(errno.EISDIR)
         elif kind == "json":
             path.write_text("{", encoding="utf-8")
             reason = "JSON result cannot be parsed"
@@ -94,7 +97,7 @@ def main():
     case = sys.argv[1]
     if case == "missing":
         exercise_missing()
-    elif case in {"io", "json", "schema"}:
+    elif case in {"io", "io-directory", "json", "schema"}:
         exercise_invalid(case)
     elif case == "invalid-cli":
         exercise_invalid_cli()

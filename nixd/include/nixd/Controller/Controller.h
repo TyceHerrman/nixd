@@ -14,6 +14,7 @@
 
 #include <filesystem>
 #include <set>
+#include <shared_mutex>
 
 namespace nixd {
 
@@ -26,6 +27,21 @@ private:
 
   // Use this worker for evaluating nixpkgs.
   std::unique_ptr<AttrSetClientProc> NixpkgsEval;
+
+  std::shared_mutex NixpkgsLock;
+  bool ActiveNixpkgs = false; // GUARDED_BY(NixpkgsLock)
+
+  class NixpkgsClientGuard {
+    std::shared_lock<std::shared_mutex> Lock;
+    AttrSetClient *Client;
+
+  public:
+    NixpkgsClientGuard(std::shared_lock<std::shared_mutex> Lock,
+                       AttrSetClient *Client)
+        : Lock(std::move(Lock)), Client(Client) {}
+
+    AttrSetClient *get() const { return Client; }
+  };
 
   std::mutex OptionsLock;
   // Map of option providers.
@@ -40,7 +56,11 @@ private:
     return *NixpkgsEval;
   }
 
-  AttrSetClient *nixpkgsClient() { return nixpkgsEval().client(); }
+  NixpkgsClientGuard acquireNixpkgsClient() {
+    std::shared_lock Guard(NixpkgsLock);
+    AttrSetClient *Client = ActiveNixpkgs ? nixpkgsEval().client() : nullptr;
+    return {std::move(Guard), Client};
+  }
 
   void evalExprWithProgress(AttrSetClient &Client, const EvalExprParams &Params,
                             std::string_view Description);

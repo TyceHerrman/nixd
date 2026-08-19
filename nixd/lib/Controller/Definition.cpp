@@ -322,20 +322,22 @@ std::vector<T> mergeVec(std::vector<T> A, const std::vector<T> &B) {
 
 llvm::Expected<Locations>
 defineVar(const ExprVar &Var, const VariableLookupAnalysis &VLA,
-          const ParentMapAnalysis &PM, AttrSetClient &NixpkgsClient,
+          const ParentMapAnalysis &PM, AttrSetClient *NixpkgsClient,
           const URIForFile &URI, llvm::StringRef Src) {
   try {
     Locations StaticLocs = defineVarStatic(Var, VLA, URI, Src);
 
-    // Nixpkgs locations.
-    try {
-      Selector Sel = mkVarSelector(Var, VLA, PM);
-      Locations NixpkgsLocs = defineNixpkgsSelector(Sel, NixpkgsClient);
-      return mergeVec(std::move(StaticLocs), NixpkgsLocs);
-    } catch (std::exception &E) {
-      elog("definition/idiom/selector: {0}", E.what());
-      return StaticLocs;
+    if (NixpkgsClient) {
+      // Nixpkgs locations.
+      try {
+        Selector Sel = mkVarSelector(Var, VLA, PM);
+        Locations NixpkgsLocs = defineNixpkgsSelector(Sel, *NixpkgsClient);
+        return mergeVec(std::move(StaticLocs), NixpkgsLocs);
+      } catch (std::exception &E) {
+        elog("definition/idiom/selector: {0}", E.what());
+      }
     }
+    return StaticLocs;
   } catch (std::exception &E) {
     elog("definition/static: {0}", E.what());
     return Locations{};
@@ -394,17 +396,23 @@ void Controller::onDefinition(const TextDocumentPositionParams &Params,
       const auto &UpExpr = *CheckDefault(PM.upExpr(N));
 
       // Special case for inherited names.
-      if (const ExprVar *Var = findInheritVar(N, PM, VLA))
-        return defineVar(*Var, VLA, PM, *nixpkgsClient(), URI, TU->src());
+      if (const ExprVar *Var = findInheritVar(N, PM, VLA)) {
+        auto Nixpkgs = acquireNixpkgsClient();
+        return defineVar(*Var, VLA, PM, Nixpkgs.get(), URI, TU->src());
+      }
 
       switch (UpExpr.kind()) {
       case Node::NK_ExprVar: {
+        auto Nixpkgs = acquireNixpkgsClient();
         const auto &Var = static_cast<const ExprVar &>(UpExpr);
-        return defineVar(Var, VLA, PM, *nixpkgsClient(), URI, TU->src());
+        return defineVar(Var, VLA, PM, Nixpkgs.get(), URI, TU->src());
       }
       case Node::NK_ExprSelect: {
+        auto Nixpkgs = acquireNixpkgsClient();
         const auto &Sel = static_cast<const ExprSelect &>(UpExpr);
-        return defineSelect(Sel, VLA, PM, *nixpkgsClient());
+        if (AttrSetClient *Client = Nixpkgs.get())
+          return defineSelect(Sel, VLA, PM, *Client);
+        return Locations{};
       }
       case Node::NK_ExprAttrs:
         return defineAttrPath(N, PM, OptionsLock, Options, ActiveOptions);

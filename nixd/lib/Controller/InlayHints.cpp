@@ -129,7 +129,11 @@ void Controller::onInlayHint(const InlayHintsParams &Params,
       const auto AST = CheckDefault(getAST(*TU));
       // Perform inlay hints computation on the range.
       std::vector<InlayHint> Response;
-      NixpkgsInlayHintsProvider NP(*nixpkgsClient(), *TU->variableLookup(),
+      auto Nixpkgs = acquireNixpkgsClient();
+      AttrSetClient *Client = Nixpkgs.get();
+      if (!Client)
+        return Response;
+      NixpkgsInlayHintsProvider NP(*Client, *TU->variableLookup(),
                                    *TU->parentMap(), Range, Response,
                                    TU->src());
       NP.dfs(AST.get());
