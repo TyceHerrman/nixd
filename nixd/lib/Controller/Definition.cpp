@@ -256,22 +256,22 @@ std::optional<Location> definePath(const ExprPath &Path,
 /// \brief Get the locations of some attribute path.
 ///
 /// Usually this function will return a list of option declarations via RPC
-Locations defineAttrPath(const Node &N, const ParentMapAnalysis &PM,
-                         std::mutex &OptionsLock,
-                         Controller::OptionMapTy &Options) {
+template <typename IsCurrentTy>
+Locations defineAttrPath(
+    const Node &N, const ParentMapAnalysis &PM,
+    const std::vector<std::pair<std::string, AttrSetClient *>> &Options,
+    IsCurrentTy IsCurrent) {
   using PathResult = FindAttrPathResult;
   std::vector<std::string> Scope;
   auto R = findAttrPathForOptions(N, PM, Scope);
   Locations Locs;
   if (R == PathResult::OK) {
-    std::lock_guard _(OptionsLock);
-    // For each option worker, try to get it's decl position.
-    for (const auto &[_, Client] : Options) {
-      if (AttrSetClient *C = Client->client()) {
-        OptionsDefinitionProvider ODP(*C);
-        ODP.resolveLocations(Scope, Locs);
-      }
+    for (const auto &[Name, Client] : Options) {
+      OptionsDefinitionProvider ODP(*Client);
+      ODP.resolveLocations(Scope, Locs);
     }
+    if (!IsCurrent())
+      return {};
   }
   return Locs;
 }
@@ -317,22 +317,25 @@ std::vector<T> mergeVec(std::vector<T> A, const std::vector<T> &B) {
   return A;
 }
 
+template <typename IsCurrentTy>
 llvm::Expected<Locations>
 defineVar(const ExprVar &Var, const VariableLookupAnalysis &VLA,
-          const ParentMapAnalysis &PM, AttrSetClient &NixpkgsClient,
-          const URIForFile &URI, llvm::StringRef Src) {
+          const ParentMapAnalysis &PM, AttrSetClient *NixpkgsClient,
+          IsCurrentTy IsCurrent, const URIForFile &URI, llvm::StringRef Src) {
   try {
     Locations StaticLocs = defineVarStatic(Var, VLA, URI, Src);
 
-    // Nixpkgs locations.
-    try {
-      Selector Sel = mkVarSelector(Var, VLA, PM);
-      Locations NixpkgsLocs = defineNixpkgsSelector(Sel, NixpkgsClient);
-      return mergeVec(std::move(StaticLocs), NixpkgsLocs);
-    } catch (std::exception &E) {
-      elog("definition/idiom/selector: {0}", E.what());
-      return StaticLocs;
+    if (NixpkgsClient) {
+      try {
+        Selector Sel = mkVarSelector(Var, VLA, PM);
+        Locations NixpkgsLocs = defineNixpkgsSelector(Sel, *NixpkgsClient);
+        if (IsCurrent())
+          return mergeVec(std::move(StaticLocs), NixpkgsLocs);
+      } catch (std::exception &E) {
+        elog("definition/idiom/selector: {0}", E.what());
+      }
     }
+    return StaticLocs;
   } catch (std::exception &E) {
     elog("definition/static: {0}", E.what());
     return Locations{};
@@ -391,20 +394,38 @@ void Controller::onDefinition(const TextDocumentPositionParams &Params,
       const auto &UpExpr = *CheckDefault(PM.upExpr(N));
 
       // Special case for inherited names.
-      if (const ExprVar *Var = findInheritVar(N, PM, VLA))
-        return defineVar(*Var, VLA, PM, *nixpkgsClient(), URI, TU->src());
+      if (const ExprVar *Var = findInheritVar(N, PM, VLA)) {
+        auto Nixpkgs = acquireNixpkgsClient();
+        return defineVar(*Var, VLA, PM, Nixpkgs.get(),
+                         [this, &Nixpkgs] { return isNixpkgsCurrent(Nixpkgs); },
+                         URI, TU->src());
+      }
 
       switch (UpExpr.kind()) {
       case Node::NK_ExprVar: {
+        auto Nixpkgs = acquireNixpkgsClient();
         const auto &Var = static_cast<const ExprVar &>(UpExpr);
-        return defineVar(Var, VLA, PM, *nixpkgsClient(), URI, TU->src());
+        return defineVar(Var, VLA, PM, Nixpkgs.get(),
+                         [this, &Nixpkgs] { return isNixpkgsCurrent(Nixpkgs); },
+                         URI, TU->src());
       }
       case Node::NK_ExprSelect: {
+        auto Nixpkgs = acquireNixpkgsClient();
         const auto &Sel = static_cast<const ExprSelect &>(UpExpr);
-        return defineSelect(Sel, VLA, PM, *nixpkgsClient());
+        if (AttrSetClient *Client = Nixpkgs.get()) {
+          Locations Locs = defineSelect(Sel, VLA, PM, *Client);
+          if (isNixpkgsCurrent(Nixpkgs))
+            return Locs;
+        }
+        return Locations{};
       }
       case Node::NK_ExprAttrs:
-        return defineAttrPath(N, PM, OptionsLock, Options);
+        {
+          auto Options = acquireOptionClients();
+          return defineAttrPath(
+              N, PM, Options.Clients,
+              [this, &Options] { return isOptionsCurrent(Options); });
+        }
       case Node::NK_ExprPath: {
         const auto &Path = static_cast<const ExprPath &>(UpExpr);
         if (auto Loc = definePath(Path, File))

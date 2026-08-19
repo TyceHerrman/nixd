@@ -12,6 +12,8 @@
 
 #include <boost/asio/thread_pool.hpp>
 
+#include <cstdint>
+#include <filesystem>
 #include <set>
 
 namespace nixd {
@@ -26,12 +28,30 @@ private:
   // Use this worker for evaluating nixpkgs.
   std::unique_ptr<AttrSetClientProc> NixpkgsEval;
 
+  std::mutex NixpkgsStateLock;
+  bool ActiveNixpkgs = false;          // GUARDED_BY(NixpkgsStateLock)
+  std::uint64_t NixpkgsGeneration = 0; // GUARDED_BY(NixpkgsStateLock)
+
+  struct NixpkgsClientToken {
+    AttrSetClient *Client;
+    std::uint64_t Generation;
+
+    AttrSetClient *get() const { return Client; }
+  };
+
   std::mutex OptionsLock;
   // Map of option providers.
   //
   // e.g. "nixos" -> nixos worker
   //      "home-manager" -> home-manager worker
   OptionMapTy Options; // GUARDED_BY(OptionsLock)
+  std::set<std::string> ActiveOptions; // GUARDED_BY(OptionsLock)
+  std::uint64_t OptionsGeneration = 0; // GUARDED_BY(OptionsLock)
+
+  struct OptionClientToken {
+    std::vector<std::pair<std::string, AttrSetClient *>> Clients;
+    std::uint64_t Generation;
+  };
 
   AttrSetClientProc &nixpkgsEval() {
     assert(NixpkgsEval);
@@ -39,6 +59,33 @@ private:
   }
 
   AttrSetClient *nixpkgsClient() { return nixpkgsEval().client(); }
+
+  NixpkgsClientToken acquireNixpkgsClient() {
+    std::lock_guard Guard(NixpkgsStateLock);
+    return {ActiveNixpkgs ? nixpkgsEval().client() : nullptr,
+            NixpkgsGeneration};
+  }
+
+  bool isNixpkgsCurrent(const NixpkgsClientToken &Token) {
+    std::lock_guard Guard(NixpkgsStateLock);
+    return Token.Client && ActiveNixpkgs &&
+           Token.Generation == NixpkgsGeneration;
+  }
+
+  OptionClientToken acquireOptionClients() {
+    std::lock_guard Guard(OptionsLock);
+    OptionClientToken Token{{}, OptionsGeneration};
+    for (const auto &[Name, Provider] : Options)
+      if (ActiveOptions.contains(Name))
+        if (AttrSetClient *Client = Provider->client())
+          Token.Clients.emplace_back(Name, Client);
+    return Token;
+  }
+
+  bool isOptionsCurrent(const OptionClientToken &Token) {
+    std::lock_guard Guard(OptionsLock);
+    return Token.Generation == OptionsGeneration;
+  }
 
   void evalExprWithProgress(AttrSetClient &Client, const EvalExprParams &Params,
                             std::string_view Description);
@@ -49,6 +96,17 @@ private:
 
   std::mutex ConfigLock;
   Configuration Config; // GUARDED_BY(ConfigLock)
+  Configuration BaseConfig;
+
+  std::mutex WorkspaceConfigLock;
+  std::uint64_t WorkspaceConfigGeneration = 0; // GUARDED_BY(WorkspaceConfigLock)
+
+  struct WorkspaceRoot {
+    std::filesystem::path path;
+  } Root;
+  std::filesystem::path LaunchDirectory;
+  bool SkipProjectConfig = false;
+  std::optional<lspserver::ShowMessageParams> PendingStartupWarning;
 
   llvm::unique_function<void(const lspserver::ConfigurationParams &,
                              lspserver::Callback<llvm::json::Value>)>
@@ -65,8 +123,13 @@ private:
   /// \brief Get configuration from LSP client. Update the config.
   void fetchConfig();
 
+  Configuration builtinConfig() const;
+  void selectWorkspaceRoot(const lspserver::InitializeParams &Params);
+  void selectBaseConfig();
+
   llvm::unique_function<void(const lspserver::PublishDiagnosticsParams &)>
       PublishDiagnostic;
+  llvm::unique_function<void(const lspserver::ShowMessageParams &)> ShowMessage;
   llvm::unique_function<void(const lspserver::WorkDoneProgressCreateParams &,
                              lspserver::Callback<std::nullptr_t>)>
       CreateWorkDoneProgress;

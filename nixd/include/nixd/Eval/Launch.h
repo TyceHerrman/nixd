@@ -2,14 +2,19 @@
 
 #include "AttrSetClient.h"
 
+#include <filesystem>
+
 namespace nixd {
 
 void startAttrSetEval(const std::string &Name,
-                      std::unique_ptr<AttrSetClientProc> &Worker);
+                      std::unique_ptr<AttrSetClientProc> &Worker,
+                      const std::filesystem::path &Root);
 
-void startNixpkgs(std::unique_ptr<AttrSetClientProc> &NixpkgsEval);
+void startNixpkgs(std::unique_ptr<AttrSetClientProc> &NixpkgsEval,
+                  const std::filesystem::path &Root);
 
 void startOption(const std::string &Name,
-                 std::unique_ptr<AttrSetClientProc> &Worker);
+                 std::unique_ptr<AttrSetClientProc> &Worker,
+                 const std::filesystem::path &Root);
 
 } // namespace nixd

@@ -15,6 +15,11 @@
 
 #include <llvm/Support/CommandLine.h>
 
+#include <cerrno>
+#include <filesystem>
+#include <system_error>
+#include <unistd.h>
+
 using namespace nixd;
 using namespace util;
 using namespace llvm::json;
@@ -83,9 +88,81 @@ void Controller::evalExprWithProgress(AttrSetClient &Client,
   Client.evalExpr(Params, std::move(Action));
 }
 
+Configuration Controller::builtinConfig() const {
+  Configuration Result;
+  Result.nixpkgs.expr = getDefaultNixpkgsExpr();
+  Result.options.emplace("nixos", Configuration::OptionProvider{
+                                      .expr = getDefaultNixOSOptionsExpr(),
+                                  });
+  return Result;
+}
+
+void Controller::selectWorkspaceRoot(const InitializeParams &Params) {
+  std::optional<std::filesystem::path> SuppliedRoot;
+  if (Params.rootUri && *Params.rootUri)
+    SuppliedRoot = Params.rootUri->file().str();
+  else if (Params.rootPath && !Params.rootPath->empty())
+    SuppliedRoot = *Params.rootPath;
+
+  if (!SuppliedRoot)
+    return;
+
+  std::error_code EC;
+  const std::filesystem::file_status Status =
+      std::filesystem::status(*SuppliedRoot, EC);
+  std::string Reason;
+  if (EC)
+    Reason = EC.message();
+  else if (!std::filesystem::exists(Status))
+    Reason = "path does not exist";
+  else if (!std::filesystem::is_directory(Status))
+    Reason = "path is not a directory";
+  else if (access(SuppliedRoot->c_str(), X_OK) != 0)
+    Reason = std::error_code(errno, std::generic_category()).message();
+
+  if (Reason.empty()) {
+    Root.path = std::move(*SuppliedRoot);
+    return;
+  }
+
+  std::string Message = llvm::formatv(
+      "unusable workspace root {0}: {1}; using launch directory {2}",
+      SuppliedRoot->string(), Reason, LaunchDirectory.string());
+  lspserver::elog("{0}", Message);
+  PendingStartupWarning = ShowMessageParams{
+      .type = MessageType::Warning,
+      .message = std::move(Message),
+  };
+  Root.path = LaunchDirectory;
+  SkipProjectConfig = true;
+}
+
+void Controller::selectBaseConfig() {
+  CommandLineConfiguration CLI = parseCLIConfig();
+  if (CLI.config) {
+    BaseConfig = *CLI.config;
+  } else if (CLI.enableProjectConfig && !SkipProjectConfig) {
+    ProjectConfigLoadResult Loaded = loadProjectConfig(Root.path.string());
+    if (Loaded.error) {
+      std::string Message = llvm::formatv(
+          "failed to load project configuration at {0}: {1}",
+          Loaded.error->path, Loaded.error->message);
+      lspserver::elog("{0}", Message);
+      PendingStartupWarning = ShowMessageParams{
+          .type = MessageType::Warning,
+          .message = std::move(Message),
+      };
+    }
+    BaseConfig = Loaded.config.value_or(builtinConfig());
+  } else {
+    BaseConfig = builtinConfig();
+  }
+  updateConfig(BaseConfig);
+}
+
 void Controller::
     onInitialize( // NOLINT(readability-convert-member-functions-to-static)
-        [[maybe_unused]] const InitializeParams &Params,
+        const InitializeParams &Params,
         Callback<Value> Reply) {
 
   Object ServerCaps{
@@ -171,25 +248,19 @@ void Controller::
 
   ClientCaps = Params.capabilities;
 
-  // Start default workers.
-  startNixpkgs(NixpkgsEval);
+  selectWorkspaceRoot(Params);
 
-  if (nixpkgsClient()) {
-    evalExprWithProgress(*nixpkgsClient(), getDefaultNixpkgsExpr(),
-                         "nixpkgs entries");
-  }
+  // Start workers at the selected root. They are retained while configuration
+  // changes only alter which providers are visible to language features.
+  startNixpkgs(NixpkgsEval, Root.path);
 
   // Launch nixos worker also.
   {
     std::lock_guard _(OptionsLock);
-    startOption("nixos", Options["nixos"]);
-
-    if (AttrSetClient *Client = Options["nixos"]->client())
-      evalExprWithProgress(*Client, getDefaultNixOSOptionsExpr(),
-                           "nixos options");
+    startOption("nixos", Options["nixos"], Root.path);
   }
   try {
-    Config = parseCLIConfig();
+    selectBaseConfig();
   } catch (LLVMErrorException &Err) {
     lspserver::elog("parse CLI config error: {0}, {1}", Err.what(),
                     Err.takeError());
@@ -198,7 +269,12 @@ void Controller::
   fetchConfig();
 }
 
-void Controller::onInitialized(const lspserver::InitializedParams &Params) {}
+void Controller::onInitialized(const lspserver::InitializedParams &Params) {
+  if (!PendingStartupWarning)
+    return;
+  ShowMessage(*PendingStartupWarning);
+  PendingStartupWarning.reset();
+}
 
 void Controller::onShutdown(const lspserver::NoParams &,
                             lspserver::Callback<std::nullptr_t> Reply) {
