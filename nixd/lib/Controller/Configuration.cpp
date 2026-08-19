@@ -2,8 +2,6 @@
 #include "nixd/Eval/Launch.h"
 #include "nixd/Support/JSON.h"
 
-#include <boost/asio/post.hpp>
-
 #include <cstring>
 #include <fstream>
 
@@ -230,11 +228,22 @@ void Controller::fetchConfig() {
       return;
     }
     const auto &Responses = *Resp->getAsArray();
-    if (Responses.empty() || Responses.front().kind() == Value::Null)
+    if (Responses.empty())
       return;
+    if (Responses.front().kind() == Value::Null) {
+      Configuration Base;
+      {
+        std::lock_guard G(ConfigLock);
+        Base = BaseConfig;
+      }
+      updateConfig(std::move(Base));
+      return;
+    }
     const Value &FirstConfig = Responses.front();
 
-    // Run this job in the thread pool. Don't block input thread.
+    // Apply a completed editor update before handling the next client request.
+    // updateConfig only dispatches evaluator work; queueing this composition
+    // itself made later requests observe a stale configuration.
     auto ConfigAction = [this, FirstConfig]() mutable {
       // Parse the config
       ConfigurationPatch Patch;
@@ -253,7 +262,7 @@ void Controller::fetchConfig() {
       updateConfig(overlay(std::move(Base), Patch));
     };
 
-    boost::asio::post(Pool, std::move(ConfigAction));
+    ConfigAction();
   };
   workspaceConfiguration({.items = {ConfigurationItem{.section = "nixd"}}},
                          std::move(Action));

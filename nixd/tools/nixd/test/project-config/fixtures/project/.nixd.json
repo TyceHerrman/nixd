@@ -11,6 +11,6 @@
     }
   },
   "diagnostic": {
-    "suppress": ["unused_binding"]
+    "suppress": ["sema-unused-def-lambda-noarg-formal"]
   }
 }
