@@ -33,13 +33,82 @@ For advanced users, e.g. having many custom modules, or want to extend anyother 
 * custom nixpkgs path, input from your "system" flake
 
 
-### Where to place the configuration
+### Configuration sources and precedence
 
-> In legacy versions (v1.x), configurations are written in ".nixd.json", please remove them and nixd won't even read such files anymore.
+> [!WARNING]
+> Enable project configuration only for workspaces you trust. A project file
+> can provide Nix expressions for nixd to evaluate and formatter executables
+> for nixd to run.
 
-All configuration should go in `nixd` section.
-`nixd` accept language server protocol specified `workspace/configuration` to fetch config file.
-So the location of configuration file basically determined by your editor setup.
+Project configuration is disabled by default. Enable it explicitly:
+
+```console
+nixd --enable-project-config
+```
+
+nixd selects one root in this order: `rootUri`, a non-empty `rootPath`, then
+the directory in which nixd was launched. It reads exactly
+`<root>/.nixd.json`; it does not search ancestors or nested projects. If a
+supplied root is unusable, nixd warns, skips project-file loading, and falls
+back to the launch directory.
+
+The base configuration is selected in this order:
+
+1. JSON passed to `--config`; this suppresses project-file loading.
+2. A valid opted-in `<root>/.nixd.json`.
+3. Built-in defaults.
+
+`--config` and `.nixd.json` are complete, unwrapped configuration objects:
+`formatting`, named `options`, `nixpkgs`, and `diagnostic`. They are not
+patches over the built-ins, and legacy `eval.target` and `options.target` are
+not supported. Omitted fields use their C++ defaults, including
+`formatting.command` defaulting to `["nixfmt"]`.
+
+Editor settings come from LSP `workspace/configuration`, under the client's
+`nixd` section. They are a partial overlay rebuilt from the selected base:
+omitted fields retain base values, while a supplied `options` object replaces
+the entire options map. `[null]` and `[{}]` remove editor overrides and restore
+the base; empty, malformed, or unsupported responses retain the active
+configuration.
+
+A missing `.nixd.json` is silent. An existing unreadable, invalid JSON, or
+schema-invalid file logs its path and error, warns once after `initialized`,
+and falls back to built-in defaults. An invalid `--config` is fatal.
+
+Restart nixd after changing `.nixd.json`: there is no filesystem watcher.
+Ancestor discovery, nested configuration files, and multi-root project
+configuration are unsupported. Relative evaluator expressions and formatter
+commands run from the effective workspace root (or the launch-directory
+fallback).
+
+Example `.nixd.json`:
+
+```json
+{
+  "$schema": "https://json.schemastore.org/nixd-schema.json",
+  "nixpkgs": {
+    "expr": "import (builtins.getFlake (builtins.toString ./.)).inputs.nixpkgs { }"
+  },
+  "options": {
+    "nixos": {
+      "expr": "(builtins.getFlake (builtins.toString ./.)).nixosConfigurations.<hostname>.options"
+    }
+  },
+  "formatting": {
+    "command": ["nixfmt"]
+  },
+  "diagnostic": {
+    "suppress": ["sema-extra-with"]
+  }
+}
+```
+
+Replace `<hostname>` with a flake output name.
+
+### Editor configuration
+
+Editor configuration belongs in the client's `nixd` section. Its location is
+determined by the editor setup.
 
 
 > Please extend this list for your editor, thanks!
@@ -141,7 +210,9 @@ You can also set the `eglot-workspace-configuration` variable globally (by using
 ### Configuration overview
 
 > [!NOTE]
-> This annotated json are under the key "nixd". If you don't know what does exactly this mean please see editor examples above.
+> This is an editor overlay and belongs under the `nixd` key. Project files and
+> `--config` use the same object without that wrapper. In an editor overlay,
+> omitted fields preserve the selected base configuration.
 
 ```jsonc
 {
@@ -216,9 +287,12 @@ prefer to suppress diagnostics altogether. This can be achieved by utilizing the
 }
 ```
 
-#### Format ("formating")
+#### Format (`formatting`)
 
-To configure which command will be used for formatting, you can change the "formatting" section.
+Configure the formatter with a command array, or a direct string shorthand for
+a one-element array. In a complete project/CLI base, an object without
+`command` uses `["nixfmt"]`; an omitted editor-overlay command preserves the
+base formatter.
 
 ```jsonc
 {
