@@ -36,6 +36,25 @@ bool mapOptOrNull(const llvm::json::Value &Params, llvm::StringLiteral Prop,
     return true;
   return fromJSON(*V, Out, P.field(Prop));
 }
+
+template <typename T>
+void mapInitializeField(const llvm::json::Object &Object,
+                        llvm::StringLiteral Name, std::optional<T> &Out,
+                        bool &Provided, std::optional<std::string> &Error) {
+  const llvm::json::Value *Field = Object.get(Name);
+  if (!Field || Field->getAsNull())
+    return;
+
+  Provided = true;
+  T Parsed;
+  llvm::json::Path::Root FieldPath;
+  llvm::json::Path RootPath(FieldPath);
+  if (!fromJSON(*Field, Parsed, RootPath.field(Name))) {
+    Error = llvm::toString(FieldPath.getError());
+    return;
+  }
+  Out = std::move(Parsed);
+}
 } // namespace
 
 char LSPError::ID;
@@ -83,6 +102,7 @@ bool fromJSON(const llvm::json::Value &E, URIForFile &R, llvm::json::Path P) {
     R = std::move(*U);
     return true;
   }
+  P.report("expected URI string");
   return false;
 }
 
@@ -604,17 +624,34 @@ bool fromJSON(const llvm::json::Value &Params, InitializeParams &R,
   llvm::json::ObjectMapper O(Params, P);
   if (!O)
     return false;
+  const auto &Object = *Params.getAsObject();
   // We deliberately don't fail if we can't parse individual fields.
   // Failing to handle a slightly malformed initialize would be a disaster.
   O.map("processId", R.processId);
-  O.map("rootUri", R.rootUri);
-  O.map("rootPath", R.rootPath);
+  mapInitializeField(Object, "rootUri", R.rootUri, R.rootUriProvided,
+                     R.rootUriError);
+  mapInitializeField(Object, "rootPath", R.rootPath, R.rootPathProvided,
+                     R.rootPathError);
+  if (const auto *Folders = Object.get("workspaceFolders");
+      Folders && !Folders->getAsNull()) {
+    R.workspaceFoldersProvided = true;
+    if (const auto *Array = Folders->getAsArray())
+      R.workspaceFoldersCount = Array->size();
+    mapInitializeField(Object, "workspaceFolders", R.workspaceFolders,
+                       R.workspaceFoldersProvided, R.workspaceFoldersError);
+  }
   O.map("capabilities", R.capabilities);
   if (auto *RawCaps = Params.getAsObject()->getObject("capabilities"))
     R.rawCapabilities = *RawCaps;
   O.map("trace", R.trace);
   O.map("initializationOptions", R.initializationOptions);
   return true;
+}
+
+bool fromJSON(const llvm::json::Value &Params, WorkspaceFolder &R,
+              llvm::json::Path P) {
+  llvm::json::ObjectMapper O(Params, P);
+  return O && O.map("uri", R.uri) && O.map("name", R.name);
 }
 
 llvm::json::Value toJSON(const WorkDoneProgressCreateParams &P) {

@@ -12,7 +12,10 @@
 
 namespace lspserver {
 
-void LSPServer::run() { In->loop(*this); }
+void LSPServer::run() {
+  In->loop(*this);
+  closeRequestGate("input loop closed");
+}
 
 bool LSPServer::onNotify(llvm::StringRef Method, llvm::json::Value Params) {
   log("<-- {0}", Method);
@@ -78,23 +81,60 @@ bool LSPServer::onReply(llvm::json::Value ID,
   return true;
 }
 
-int LSPServer::bindReply(Callback<llvm::json::Value> CB) {
-  std::lock_guard<std::mutex> _(PendingCallsLock);
-  int Ret = TopID++;
-  PendingCalls[Ret] = std::move(CB);
+void LSPServer::callMethod(llvm::StringRef Method, llvm::json::Value Params,
+                           Callback<llvm::json::Value> CB, OutboundPort *O) {
+  std::optional<Callback<llvm::json::Value>> Rejected;
+  std::optional<std::pair<int, Callback<llvm::json::Value>>> Oldest;
+  std::string RejectionReason;
+  {
+    std::lock_guard Guard(PendingCallsLock);
+    if (RequestGateClosed) {
+      Rejected = std::move(CB);
+      RejectionReason = RequestGateReason;
+    } else {
+      const int ID = TopID++;
+      PendingCalls.emplace(ID, std::move(CB));
+      log("--> call {0}({1})", Method, ID);
+      O->call(Method, std::move(Params), ID);
 
-  // Check the limit
-  if (PendingCalls.size() > MaxPendingCalls) {
-    auto Begin = PendingCalls.begin();
-    auto [ID, OldestCallback] =
-        std::tuple{Begin->first, std::move(Begin->second)};
-    OldestCallback(
+      if (PendingCalls.size() > MaxPendingCalls) {
+        auto Begin = PendingCalls.begin();
+        Oldest.emplace(Begin->first, std::move(Begin->second));
+        PendingCalls.erase(Begin);
+      }
+    }
+  }
+
+  if (Rejected)
+    (*Rejected)(error("cannot send client request: {0}", RejectionReason));
+  if (Oldest) {
+    const int ID = Oldest->first;
+    Oldest->second(
         error("failed to receive a client reply for request ({0})", ID));
     elog("more than {0} outstanding LSP calls, forgetting about {1}",
          MaxPendingCalls, ID);
-    PendingCalls.erase(Begin);
   }
-  return Ret;
+}
+
+void LSPServer::failPendingCalls(
+    std::map<int, Callback<llvm::json::Value>> Calls, llvm::StringRef Reason) {
+  for (auto &[ID, CB] : Calls)
+    CB(error("client request ({0}) failed: {1}", ID, Reason));
+}
+
+void LSPServer::closeRequestGate(std::string Reason) {
+  std::map<int, Callback<llvm::json::Value>> Calls;
+  std::string FailureReason;
+  {
+    std::lock_guard Guard(PendingCallsLock);
+    if (RequestGateClosed)
+      return;
+    RequestGateClosed = true;
+    RequestGateReason = std::move(Reason);
+    FailureReason = RequestGateReason;
+    Calls.swap(PendingCalls);
+  }
+  failPendingCalls(std::move(Calls), FailureReason);
 }
 
 } // namespace lspserver

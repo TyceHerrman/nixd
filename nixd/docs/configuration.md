@@ -1,329 +1,123 @@
 ## Configuration
 
+`nixd` starts with built-in configuration and can receive configuration from the command line, an explicitly trusted project file, and the LSP client. The same strict JSON patch grammar is used for every non-null configuration source. The [JSON schema](nixd-schema.json) provides editor assistance; nixd validates input itself and does not fetch a schema URL at runtime.
 
-We support LSP standard `workspace/configuration` for server configurations.
+### Sources and trust
 
-### Default configuration & Who needs configuration
+The startup base is selected in this order:
 
-Most important part of package/options features is the path of "nixpkgs".
-By default, this is search via standard nix search path.
-That is, find nixpkgs via `<nixpkgs>`.
+1. Built-in defaults. `nixpkgs.expr` defaults to `import <nixpkgs> { }`, with a default `nixos` option provider.
+2. An explicit `--config=<JSON>` patch, if present. It is authoritative: `--config={}` is an explicit empty patch and still prevents project-file inspection.
+3. `<project-root>/.nixd.json`, only when `--enable-project-config` is passed and `--config` is absent.
 
-For nix-channels users: nixos option & package features shall work out of box, without any extra effort.
+Project configuration is intentionally opt-in because its expressions can evaluate Nix and its formatter command can execute a program. Do not enable it for an untrusted checkout. Without `--enable-project-config`, nixd never reads `.nixd.json`.
 
-For nix-flake users: (suggestion) you can set $NIX_PATH env to your flake input. e.g.
+The project file is read once during initialization. It is exactly `<project-root>/.nixd.json`: nixd does not search parent directories, watch the file, or reload it. A missing file is silent. An unreadable, malformed, or schema-invalid file leaves the startup base and working directory unchanged, logs the error, and sends one warning after the client has initialized.
 
-```nix
-{ inputs, ... }:
+### Project root and working directory
+
+When project configuration is eligible, nixd chooses one root from `initialize` in this order:
+
+1. A usable `rootUri`.
+2. A nonempty `rootPath`.
+3. The sole `workspaceFolders` entry.
+4. The process launch directory.
+
+The selected LSP root must name an accessible directory. A malformed or unusable higher-priority value is a failure, not a reason to fall through to a lower-priority field. More than one workspace folder is unsupported and also prevents project-file loading. These failures are logged and reported as startup warnings, retaining the launch directory.
+
+A valid project file, including `{}`, makes the selected project root the working directory for evaluator workers and formatter children. If the file is absent or invalid, or project configuration is not eligible, they use the launch directory instead. An explicit `--config` never selects a project root.
+
+### Patch format
+
+Configuration is a patch: every top-level section is optional, and a present section replaces only the fields it contains. Valid top-level keys are `$schema`, `nixpkgs`, `formatting`, `options`, and `diagnostic`. Unknown keys are rejected at every object level. Explicit `null` is rejected in a patch.
+
+```json
 {
-  # NixOS configuration.
-  nix.nixPath = [ "nixpkgs=${inputs.nixpkgs}" ];
-}
-```
-
-If you do not config anything in nixd, here are the defaults (suitable for most nix newbies).
-
-* nixpkgs packages comes from `import <nixpkgs> { }`
-* nixos options, evaluated from `<nixpkgs>`
-
-For advanced users, e.g. having many custom modules, or want to extend anyother options system,
-"options" field must be extended in the settings, to tell nixd how to get the modules. tldr:
-
-* custom module system (home-manager, nix-darwin, flake-parts, ...)
-* custom nixpkgs path, input from your "system" flake
-
-
-### Where to place the configuration
-
-> In legacy versions (v1.x), configurations are written in ".nixd.json", please remove them and nixd won't even read such files anymore.
-
-All configuration should go in `nixd` section.
-`nixd` accept language server protocol specified `workspace/configuration` to fetch config file.
-So the location of configuration file basically determined by your editor setup.
-
-
-> Please extend this list for your editor, thanks!
-
-<details>
- <summary>VSCode</summary>
-
-For vscode users you should write `settings.json`[^settings] like this:
-
-[^settings]: the file could be applied per-workspace, i.e. `.vscode/settings.json`, our globally, remotely. VSCode users should familiar with [these locations](https://code.visualstudio.com/docs/getstarted/settings).
-
-
-```
-{
-    "nix.serverSettings": {
-        // settings for 'nixd' LSP
-        "nixd": {
-            "formatting": {
-              // ...
-            },
-            "options": {
-              // ...
-            }
-        }
+  "$schema": "https://json.schemastore.org/nixd-schema.json",
+  "nixpkgs": {
+    "expr": "import <nixpkgs> { }"
+  },
+  "formatting": {
+    "command": ["nixfmt"]
+  },
+  "options": {
+    "nixos": {
+      "expr": "(builtins.getFlake (builtins.toString ./.)).nixosConfigurations.host.options"
+    },
+    "home-manager": {
+      "expr": "(builtins.getFlake (builtins.toString ./.)).homeConfigurations.\"user@host\".options"
+    }
+  },
+  "diagnostic": {
+    "suppress": ["sema-extra-with"]
   }
 }
 ```
 
-</details>
+`$schema`, when present, is string metadata only. It does not make nixd download or interpret an external schema.
 
-<details>
- <summary>Neovim</summary>
+| Section | Accepted patch | Effect |
+| --- | --- | --- |
+| `nixpkgs` | Object with optional string `expr` | Replaces the package/library expression. `""` disables nixpkgs evaluation. |
+| `formatting` | Nonempty string, or object with optional string-array `command` | The string is shorthand for a one-element command. `command: []` disables formatting. |
+| `options` | Object mapping arbitrary names to `{ "expr": "nonempty string" }` | Replaces the complete option-provider map. `{}` disables option completion and lookup. |
+| `diagnostic` | Object with optional string-array `suppress` | Replaces suppressed diagnostic short names. `[]` suppresses nothing. |
 
-Configuration via Neovim [built-in LSP](https://neovim.io/doc/user/lsp/#lsp). If you want to make configuration changes based on different projects, you can use Neovim official [exrc](https://neovim.io/doc/user/options/#'exrc') option.
+Arrays may be empty where shown. Object forms reject unknown keys; option providers require their nonempty `expr`. For example, these are rejected:
+
+```json
+{ "formatting": null }
+```
+
+```json
+{ "formatting": { "command": null } }
+```
+
+```json
+{ "options": { "nixos": { "expr": "", "extra": true } } }
+```
+
+```json
+{ "diagnostic": { "unknown": [] } }
+```
+
+### Editor configuration
+
+Place editor settings under the `nixd` section. For example, Neovim's built-in LSP configuration can provide the same patch:
 
 ```lua
-local nvim_lsp = vim.lsp
-nvim_lsp.config("nixd", {
+vim.lsp.config("nixd", {
   cmd = { "nixd" },
   filetypes = { "nix" },
-  root_markers = { "flake.nix", ".git" },
   settings = {
     nixd = {
-      nixpkgs = {
-        expr = "import <nixpkgs> { }",
-      },
-      formatting = {
-        command = { "nixfmt" },
-      },
+      formatting = { command = { "nixfmt" } },
+      nixpkgs = { expr = "import <nixpkgs> { }" },
       options = {
         nixos = {
-          expr = '(builtins.getFlake (toString ./.)).nixosConfigurations.<hostname>.options',
-        },
-        home_manager = {
-          expr = '(builtins.getFlake (toString ./.)).homeConfigurations."<username>@<hostname>".options',
+          expr = "(builtins.getFlake (builtins.toString ./.)).nixosConfigurations.host.options",
         },
       },
     },
   },
 })
-nvim_lsp.enable("nixd")
-```
-</details>
-
-<details>
-  <summary>Emacs</summary>
-
-  Configuration via [lsp-mode](https://github.com/emacs-lsp/lsp-mode) plugin. As of Oct 24, 2024, lsp-mode master has support for nixd autocompletion and formatting options.
-
-  ```elisp
-(use-package nix-mode
-  :after lsp-mode
-  :ensure t
-  :hook
-  (nix-mode . lsp-deferred) ;; So that envrc mode will work
-  :custom
-  (lsp-disabled-clients '((nix-mode . nix-nil))) ;; Disable nil so that nixd will be used as lsp-server
-  :config
-  (setq lsp-nix-nixd-server-path "nixd"
-        lsp-nix-nixd-formatting-command [ "nixfmt" ]
-        lsp-nix-nixd-nixpkgs-expr "import <nixpkgs> { }"
-        lsp-nix-nixd-nixos-options-expr "(builtins.getFlake \"/home/nb/nixos\").nixosConfigurations.mnd.options"
-        lsp-nix-nixd-home-manager-options-expr "(builtins.getFlake \"/home/nb/nixos\").homeConfigurations.\"nb@mnd\".options"))
-
-(add-hook! 'nix-mode-hook
-           ;; enable autocompletion with company
-           (setq company-idle-delay 0.1))
-
-  ```
-
-Configuration via [Eglot](https://www.gnu.org/software/emacs/manual/html_node/eglot/).  Eglot has been included in Emacs core since 29.1.  You can configure nixd per project by putting the following snippet into the `.dir-locals.el` file in your project.
-```lisp
-((nil . ((eglot-workspace-configuration . (:nixd (:options (:nixos (:expr "(builtins.getFlake (builtins.toString ./.)).nixosConfigurations.artemis.options"))))))))
-```
-You can also set the `eglot-workspace-configuration` variable globally (by using `setq-default`), if you prefer that.
-
-</details>
-
-### Configuration overview
-
-> [!NOTE]
-> This annotated json are under the key "nixd". If you don't know what does exactly this mean please see editor examples above.
-
-```jsonc
-{
-  "nixpkgs": {
-    // For flake.
-    // "expr": "import (builtins.getFlake \"/home/lyc/workspace/CS/OS/NixOS/flakes\").inputs.nixpkgs { }   "
-
-    // This expression will be interpreted as "nixpkgs" toplevel
-    // Nixd provides package, lib completion/information from it.
-    ///
-    // Resource Usage: Entries are lazily evaluated, entire nixpkgs takes 200~300MB for just "names".
-    ///                Package documentation, versions, are evaluated by-need.
-    "expr": "import <nixpkgs> { }"
-  },
-  "formatting": {
-    // Which command you would like to do formatting
-    "command": [ "nixfmt" ]
-  },
-  // Tell the language server your desired option set, for completion
-  // This is lazily evaluated.
-  "options": { // Map of eval information
-      // By default, this entriy will be read from `import <nixpkgs> { }`
-      // You can write arbitary nix expression here, to produce valid "options" declaration result.
-      //
-      // *NOTE*: Replace "<name>" below with your actual configuration name.
-      // If you're unsure what to use, you can verify with `nix repl` by evaluating
-      // the expression directly.
-      //
-      "nixos": {
-          "expr": "(builtins.getFlake (builtins.toString ./.)).nixosConfigurations.<name>.options"
-      },
-
-    // Before configuring Home Manager options, consider your setup:
-    // Which command do you use for home-manager switching?
-    //
-    //  A. home-manager switch --flake .#... (standalone Home Manager)
-    //  B. nixos-rebuild switch --flake .#... (NixOS with integrated Home Manager)
-    //
-    // Configuration examples for both approaches are shown below.
-    "home-manager": {
-      // A:
-      "expr": "(builtins.getFlake (builtins.toString ./.)).homeConfigurations.<name>.options"
-
-      // B:
-      "expr": "(builtins.getFlake (builtins.toString ./.)).nixosConfigurations.<name>.options.home-manager.users.type.getSubOptions []"
-    }
-  },
-  // Control the diagnostic system
-  "diagnostic": {
-    "suppress": [
-      "sema-extra-with"
-    ]
-  }
-}
+vim.lsp.enable("nixd")
 ```
 
-### Fields explanation
+If the client advertises `workspace.configuration`, nixd sends one initial `workspace/configuration` request after the `initialized` notification, and therefore after the `initialize` reply, requesting the `nixd` section. A later `workspace/didChangeConfiguration` notification requests a fresh value. Each reply must be an array containing exactly one item.
 
-#### Diagnostic Control ("diagnostic")
+An editor reply is always applied to the immutable startup base, not to the previous editor reply. Omitted editor fields therefore revert to the startup value. The wrapper values `[null]` and `[{}]` both reset the effective configuration to that base. For any other reply, the strict patch rules above apply. A malformed reply, transport failure, or stale reply leaves the active configuration unchanged; when replies race, only the latest request may take effect.
 
-Some users might feel confident in their understanding of the language and
-prefer to suppress diagnostics altogether. This can be achieved by utilizing the diagnostic field.
+### Provider and formatter behavior
 
-```jsonc
-{
-  "diagnostic": {
-    // A list of diagnostic short names
-    "suppress": [
-      "sema-extra-with"
-    ]
-  }
-}
-```
+Changing `nixpkgs` or `options` invalidates the old provider generation before replacement evaluation begins. Queries retain private snapshots and publish provider-derived results only if the snapshot is still current. Option queries are all-or-none: if any configured option provider is unavailable, fails, or is replaced, no partial option result is returned. Static language results remain available while a provider is changing.
 
-#### Format ("formating")
+Formatting runs the effective `formatting.command` with the document on standard input. An empty command (`[]`) returns no edits and starts no child process. Unchanged formatter output also returns no edits. Launch, I/O, nonzero-exit, and signal failures are returned as LSP errors. nixd drains the formatter's standard output and standard error concurrently and reaps the direct child.
 
-To configure which command will be used for formatting, you can change the "formatting" section.
+On LSP shutdown, nixd owns and terminates only formatter children it launched directly. It does not manage a formatter's descendants or implement generic process-tree ownership. A closed input loop does not retroactively kill an already accepted formatter request; shutdown does terminate active direct formatter children.
 
-```jsonc
-{
-  "formatting": {
-    // The external command to be invoked for formatting
-    "command": [ "some-command" ]
-  }
-}
-```
+### Shutdown and reload boundaries
 
-#### Options ("options")
+Project configuration is startup-only. There is no `.nixd.json` watcher or reload protocol; use an editor configuration change or restart nixd to change the effective configuration.
 
-This is our support for nixpkgs option system.
-
-Generally options are merged under a special attribute path.
-For example, NixOS options could be found at:
-
-```
-<flakeref>#nixosConfigurations.<name>.options
-```
-
-And, home-manager options also could be found at:
-
-```
-<flakeref>#homeConfigurations.<name>.options
-```
-
-In our option system, you need to specify which option set you'd like to use.
-
-```jsonc
-{
-  // Tell the language server your desired option set, for completion
-  // This is lazily evaluated.
-  "options": { // Map of eval information
-    // If this is ommited, default search path (<nixpkgs>) will be used.
-    "nixos": { // This name "nixos" could be arbitary.
-      // The expression to eval, intepret it as option declarations.
-      "expr": "(builtins.getFlake \"/home/lyc/flakes\").nixosConfigurations.adrastea.options"
-    },
-
-    // By default there is no home-manager options completion, thus you can add this entry.
-    "home-manager": {
-      "expr": "(builtins.getFlake \"/home/lyc/flakes\").homeConfigurations.\"lyc@adrastea\".options"
-    },
-
-    // For flake-parts options.
-    // Firstly read the docs here to enable "debugging", exposing declarations for nixd.
-    // https://flake.parts/debug
-    "flake-parts": {
-      "expr": "(builtins.getFlake \"/path/to/your/flake\").debug.options"
-    },
-    // For a `perSystem` flake-parts option:
-    "flake-parts2": {
-      "expr": "(builtins.getFlake \"/path/to/your/flake\").currentSystem.options"
-    }
-  }
-}
-```
-
-If you aren't a flakes user with standalone home-manager with a vanilla install then the following expression should make home-manager options appear:
-
-```jsonc
-{
-  "options": {
-    "home-manager": {
-      "expr": "(import <home-manager/modules> { configuration = ~/.config/home-manager/home.nix; pkgs = import <nixpkgs> {}; }).options"
-    }
-  }
-}
-```
-
-## Q & A
-
-### Home-manager options completion does not work. What is `homeConfigurations`?
-
-See [configuration overview](#configuration-overview).
-If your home-manager is installed as part of a NixOS module,
-the options list can be retrieved like this:
-
-```nix
-(builtins.getFlake (builtins.toString ./.)).nixosConfigurations.<name>.options.home-manager.users.type.getSubOptions []
-```
-
-### Still not working?
-
-Try testing your expression in `nix repl`. This will help you diagnose evaluation issues.
-For example:
-
-```
-nix-repl> (builtins.getFlake (builtins.toString ./.)).nixosConfigurations.<name>.options
-error: syntax error, unexpected SPATH, expecting ID or OR_KW or DOLLAR_CURLY or '"'
-  at «string»:1:65:
-       1| (builtins.getFlake (builtins.toString ./.)).nixosConfigurations.<name>.options
-        |                                                                 ^
-```
-
-Replace `<name>` with your actual configuration name:
-
-```
-nix-repl> (builtins.getFlake (builtins.toString ./.)).nixosConfigurations.adrastea.options
-{
-  _module = { ... };
-  appstream = { ... };
-  assertions = { ... };
-  boot = { ... };
-  # ... more options ..., this is expected.
-}
-```
+nixd also tracks only its own pending outbound LSP calls. On `shutdown`, and when the input loop ends, it closes that outbound gate and fails pending client-request callbacks after releasing its internal lock. New outbound calls are rejected. This is deliberately narrow: normal inbound request handling, including the reply to `shutdown`, remains possible, and it is not a general request or process-lifecycle framework.

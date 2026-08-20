@@ -12,43 +12,149 @@
 
 #include <boost/asio/thread_pool.hpp>
 
+#include <condition_variable>
+#include <cstdint>
+#include <filesystem>
 #include <set>
+#include <sys/types.h>
 
 namespace nixd {
 
-class Controller : public lspserver::LSPServer {
-public:
-  using OptionMapTy = std::map<std::string, std::unique_ptr<AttrSetClientProc>>;
+struct CommandLineConfiguration;
 
+class Controller : public lspserver::LSPServer {
 private:
+  using WorkerPtr = std::shared_ptr<AttrSetClientProc>;
   std::unique_ptr<OwnedEvalClient> Eval;
 
   // Use this worker for evaluating nixpkgs.
-  std::unique_ptr<AttrSetClientProc> NixpkgsEval;
+  WorkerPtr NixpkgsEval;
+
+  std::mutex NixpkgsStateLock;
+  bool ActiveNixpkgs = false;          // GUARDED_BY(NixpkgsStateLock)
+  bool EvaluatingNixpkgs = false;      // GUARDED_BY(NixpkgsStateLock)
+  std::uint64_t NixpkgsGeneration = 0; // GUARDED_BY(NixpkgsStateLock)
+
+  struct NixpkgsClientToken {
+    WorkerPtr Worker;
+    std::uint64_t Generation;
+
+    AttrSetClient *get() const { return Worker ? Worker->client() : nullptr; }
+  };
+
+  struct OptionProviderSlot {
+    WorkerPtr Worker;
+    std::string Expr;
+    std::uint64_t Generation = 0;
+    bool Active = false;
+    bool Evaluating = false;
+  };
 
   std::mutex OptionsLock;
-  // Map of option providers.
-  //
-  // e.g. "nixos" -> nixos worker
-  //      "home-manager" -> home-manager worker
-  OptionMapTy Options; // GUARDED_BY(OptionsLock)
+  std::map<std::string, OptionProviderSlot> Options; // GUARDED_BY(OptionsLock)
+  std::uint64_t OptionsGeneration = 0;               // GUARDED_BY(OptionsLock)
 
-  AttrSetClientProc &nixpkgsEval() {
-    assert(NixpkgsEval);
-    return *NixpkgsEval;
+  std::mutex ProviderWorkLock;
+  std::condition_variable ProviderWorkCV;
+  std::size_t ProviderWorkCount = 0; // GUARDED_BY(ProviderWorkLock)
+  bool ProviderWorkShutdown = false; // GUARDED_BY(ProviderWorkLock)
+
+  class ProviderWorkLease {
+    Controller *Owner = nullptr;
+
+  public:
+    ProviderWorkLease() = default;
+    explicit ProviderWorkLease(Controller *Owner) : Owner(Owner) {}
+    ProviderWorkLease(const ProviderWorkLease &) = delete;
+    ProviderWorkLease &operator=(const ProviderWorkLease &) = delete;
+    ProviderWorkLease(ProviderWorkLease &&Other) noexcept : Owner(Other.Owner) {
+      Other.Owner = nullptr;
+    }
+    ProviderWorkLease &operator=(ProviderWorkLease &&) = delete;
+    ~ProviderWorkLease();
+
+    explicit operator bool() const { return Owner != nullptr; }
+  };
+
+  ProviderWorkLease acquireProviderWork();
+  void releaseProviderWork();
+
+  struct OptionClientToken {
+    std::vector<std::pair<std::string, WorkerPtr>> Workers;
+    std::uint64_t Generation;
+    bool CanQuery;
+  };
+
+  NixpkgsClientToken acquireNixpkgsClient() {
+    std::lock_guard Guard(NixpkgsStateLock);
+    return {ActiveNixpkgs || EvaluatingNixpkgs ? NixpkgsEval : nullptr,
+            NixpkgsGeneration};
   }
 
-  AttrSetClient *nixpkgsClient() { return nixpkgsEval().client(); }
+  bool isNixpkgsCurrent(const NixpkgsClientToken &Token) {
+    std::lock_guard Guard(NixpkgsStateLock);
+    return Token.Worker && ActiveNixpkgs && Token.Worker == NixpkgsEval &&
+           Token.Generation == NixpkgsGeneration;
+  }
+
+  OptionClientToken acquireOptionClients() {
+    std::lock_guard Guard(OptionsLock);
+    OptionClientToken Token{{}, OptionsGeneration, true};
+    for (const auto &[Name, Slot] : Options) {
+      if (Slot.Expr.empty())
+        continue;
+      if ((Slot.Active || Slot.Evaluating) && Slot.Worker &&
+          Slot.Worker->client())
+        Token.Workers.emplace_back(Name, Slot.Worker);
+      else
+        Token.CanQuery = false;
+    }
+    if (!Token.CanQuery)
+      Token.Workers.clear();
+    return Token;
+  }
+
+  bool isOptionsCurrent(const OptionClientToken &Token) {
+    std::lock_guard Guard(OptionsLock);
+    if (!Token.CanQuery || Token.Generation != OptionsGeneration)
+      return false;
+    for (const auto &[Name, Worker] : Token.Workers) {
+      auto It = Options.find(Name);
+      if (It == Options.end() || !It->second.Active ||
+          It->second.Worker != Worker || !Worker->client())
+        return false;
+    }
+    return true;
+  }
 
   void evalExprWithProgress(AttrSetClient &Client, const EvalExprParams &Params,
-                            std::string_view Description);
+                            std::string_view Description,
+                            llvm::unique_function<void(bool)> OnComplete);
+  struct ProviderShutdownState {
+    WorkerPtr Nixpkgs;
+    std::vector<WorkerPtr> Options;
+  };
+  ProviderShutdownState beginProviderShutdown();
 
   lspserver::DraftStore Store;
 
   lspserver::ClientCapabilities ClientCaps;
 
   std::mutex ConfigLock;
-  Configuration Config; // GUARDED_BY(ConfigLock)
+  Configuration Config;     // GUARDED_BY(ConfigLock)
+  Configuration BaseConfig; // GUARDED_BY(ConfigLock)
+
+  std::mutex WorkspaceConfigLock;
+  std::uint64_t WorkspaceConfigGeneration =
+      0; // GUARDED_BY(WorkspaceConfigLock)
+
+  struct WorkspaceRoot {
+    std::filesystem::path path;
+  } Root;
+  std::filesystem::path ProjectRoot;
+  std::filesystem::path LaunchDirectory;
+  bool SkipProjectConfig = false;
+  std::optional<lspserver::ShowMessageParams> PendingStartupWarning;
 
   llvm::unique_function<void(const lspserver::ConfigurationParams &,
                              lspserver::Callback<llvm::json::Value>)>
@@ -64,6 +170,11 @@ private:
 
   /// \brief Get configuration from LSP client. Update the config.
   void fetchConfig();
+
+  Configuration builtinConfig() const;
+  void selectWorkspaceRoot(const lspserver::InitializeParams &Params);
+  void selectBaseConfig(CommandLineConfiguration CLI);
+  void setStartupWarning(std::string Message);
 
   llvm::unique_function<void(const lspserver::PublishDiagnosticsParams &)>
       PublishDiagnostic;
@@ -244,6 +355,22 @@ private:
   void onFormat(const lspserver::DocumentFormattingParams &Params,
                 lspserver::Callback<std::vector<lspserver::TextEdit>> Reply);
 
+  struct FormatterChildState {
+    std::mutex Lock;
+    pid_t PID;
+    bool Reaped = false;
+  };
+
+  using FormatterChild = std::shared_ptr<FormatterChildState>;
+  std::mutex ChildForkLock;
+  std::mutex FormatterLock;
+  std::set<FormatterChild, std::owner_less<FormatterChild>>
+      ActiveFormatters;           // GUARDED_BY(FormatterLock)
+  bool FormatterShutdown = false; // GUARDED_BY(FormatterLock)
+  void terminateFormatter(const FormatterChild &Child, int Signal);
+  int waitForFormatter(const FormatterChild &Child, int &WaitErrno);
+  void shutdownFormatters();
+
   //---------------------------------------------------------------------------/
   // Workspace features
   //---------------------------------------------------------------------------/
@@ -254,7 +381,12 @@ public:
   Controller(std::unique_ptr<lspserver::InboundPort> In,
              std::unique_ptr<lspserver::OutboundPort> Out);
 
-  ~Controller() override { Pool.join(); }
+  ~Controller() override {
+    ProviderShutdownState Providers = beginProviderShutdown();
+    Pool.join();
+    Providers.Nixpkgs.reset();
+    Providers.Options.clear();
+  }
 
   bool isReadyToEval() { return Eval && Eval->ready(); }
 };

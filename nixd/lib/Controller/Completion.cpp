@@ -219,25 +219,29 @@ public:
       : OptionClient(OptionClient), ModuleOrigin(std::move(ModuleOrigin)),
         ClientSupportSnippet(ClientSupportSnippet) {}
 
-  void completeOptions(const lspserver::Range EditRange,
+  bool completeOptions(const lspserver::Range EditRange,
                        std::vector<std::string> Scope, std::string Prefix,
                        std::vector<CompletionItem> &Items) {
     std::binary_semaphore Ready(0);
     OptionCompleteResponse Names;
-    auto OnReply = [&Ready,
-                    &Names](llvm::Expected<OptionCompleteResponse> Resp) {
+    bool Success = false;
+    auto OnReply = [&Ready, &Names,
+                    &Success](llvm::Expected<OptionCompleteResponse> Resp) {
       if (!Resp) {
         lspserver::elog("option worker reported: {0}", Resp.takeError());
         Ready.release();
         return;
       }
       Names = *Resp; // Copy response to waiting thread.
+      Success = true;
       Ready.release();
     };
     // Send request.
     AttrPathCompleteParams Params{std::move(Scope), std::move(Prefix)};
     OptionClient.optionComplete(Params, std::move(OnReply));
     Ready.acquire();
+    if (!Success)
+      return false;
     // Now we have "Names", use these to fill "Items".
     //
     // When Params.Prefix is empty, the cursor is inside an empty hole and
@@ -334,29 +338,35 @@ public:
         addItem(Items, std::move(Item));
       }
     }
+    return true;
   }
 };
 
-void completeAttrName(const lspserver::Range EditRange,
-                      const std::vector<std::string> &Scope,
-                      const std::string &Prefix,
-                      Controller::OptionMapTy &Options, bool CompletionSnippets,
-                      std::vector<CompletionItem> &List) {
+bool completeAttrName(
+    const lspserver::Range EditRange, const std::vector<std::string> &Scope,
+    const std::string &Prefix,
+    const std::vector<
+        std::pair<std::string, std::shared_ptr<AttrSetClientProc>>> &Options,
+    bool CompletionSnippets, std::vector<CompletionItem> &List) {
   for (const auto &[Name, Provider] : Options) {
-    AttrSetClient *Client = Options.at(Name)->client();
+    AttrSetClient *Client = Provider->client();
     if (!Client) [[unlikely]] {
       elog("skipped client {0} as it is dead", Name);
-      continue;
+      return false;
     }
     OptionCompletionProvider OCP(*Client, Name, CompletionSnippets);
-    OCP.completeOptions(EditRange, Scope, Prefix, List);
+    if (!OCP.completeOptions(EditRange, Scope, Prefix, List))
+      return false;
   }
+  return true;
 }
 
-void completeAttrPath(const lspserver::Range EditRange, const Node &N,
-                      const ParentMapAnalysis &PM, std::mutex &OptionsLock,
-                      Controller::OptionMapTy &Options, bool Snippets,
-                      std::vector<lspserver::CompletionItem> &Items) {
+bool completeAttrPath(
+    const lspserver::Range EditRange, const Node &N,
+    const ParentMapAnalysis &PM,
+    const std::vector<
+        std::pair<std::string, std::shared_ptr<AttrSetClientProc>>> &Options,
+    bool Snippets, std::vector<lspserver::CompletionItem> &Items) {
   std::vector<std::string> Scope;
   using PathResult = FindAttrPathResult;
   auto R = findAttrPathForOptions(N, PM, Scope);
@@ -364,11 +374,9 @@ void completeAttrPath(const lspserver::Range EditRange, const Node &N,
     // Construct request.
     std::string Prefix = Scope.back();
     Scope.pop_back();
-    {
-      std::lock_guard _(OptionsLock);
-      completeAttrName(EditRange, Scope, Prefix, Options, Snippets, Items);
-    }
+    return completeAttrName(EditRange, Scope, Prefix, Options, Snippets, Items);
   }
+  return true;
 }
 
 AttrPathCompleteParams mkParams(nixd::Selector Sel, bool IsComplete) {
@@ -391,11 +399,15 @@ AttrPathCompleteParams mkParams(nixd::Selector Sel, bool IsComplete) {
 void completeVarName(const lspserver::Range EditRange,
                      const VariableLookupAnalysis &VLA,
                      const ParentMapAnalysis &PM, const nixf::ExprVar &N,
-                     AttrSetClient &Client, std::vector<CompletionItem> &List) {
+                     AttrSetClient *Client, std::vector<CompletionItem> &List,
+                     std::size_t &ProviderStart, bool &QueriedProvider) {
 #define DBGPREFIX "completion/var"
 
   VLACompletionProvider VLAP(VLA);
   VLAP.complete(N, List, PM);
+  ProviderStart = List.size();
+  if (!Client)
+    return;
 
   // Try to complete the name by known idioms.
   try {
@@ -406,7 +418,8 @@ void completeVarName(const lspserver::Range EditRange,
       return;
 
     // Invoke nixpkgs provider to get the completion list.
-    NixpkgsCompletionProvider NCP(Client);
+    QueriedProvider = true;
+    NixpkgsCompletionProvider NCP(*Client);
     // Variable names are always incomplete.
     NCP.completePackages(EditRange, mkParams(Sel, /*IsComplete=*/false), List);
   } catch (ExceedSizeError &) {
@@ -464,8 +477,17 @@ void completeSelect(const lspserver::Range EditRange,
 void Controller::onCompletion(const CompletionParams &Params,
                               Callback<CompletionList> Reply) {
   using CheckTy = CompletionList;
+  ProviderWorkLease ProviderWork = acquireProviderWork();
+  NixpkgsClientToken Nixpkgs =
+      ProviderWork ? acquireNixpkgsClient() : NixpkgsClientToken{};
+  OptionClientToken OptionClients =
+      ProviderWork ? acquireOptionClients() : OptionClientToken{{}, 0, false};
   auto Action = [Reply = std::move(Reply), URI = Params.textDocument.uri,
-                 Pos = toNixfPosition(Params.position), this]() mutable {
+                 Pos = toNixfPosition(Params.position),
+                 Nixpkgs = std::move(Nixpkgs),
+                 OptionClients = std::move(OptionClients),
+                 ProviderWork = std::move(ProviderWork), this]() mutable {
+    (void)ProviderWork;
     const auto File = URI.file().str();
     return Reply([&]() -> llvm::Expected<CompletionList> {
       const auto TU = CheckDefault(getTU(File));
@@ -486,15 +508,21 @@ void Controller::onCompletion(const CompletionParams &Params,
 
       return [&]() {
         CompletionList List;
+        std::size_t ProviderStart = 0;
+        bool QueriedProvider = false;
+        bool OptionsSucceeded = true;
+        enum class ProviderKind { None, Nixpkgs, Options };
+        ProviderKind Provider = ProviderKind::None;
         const VariableLookupAnalysis &VLA = *TU->variableLookup();
         try {
           switch (UpExpr.kind()) {
           // In these cases, assume the cursor have "variable" scoping.
           case Node::NK_ExprVar: {
-            completeVarName(EditRange, VLA, PM,
-                            static_cast<const nixf::ExprVar &>(UpExpr),
-                            *nixpkgsClient(), List.items);
-            return List;
+            completeVarName(
+                EditRange, VLA, PM, static_cast<const nixf::ExprVar &>(UpExpr),
+                Nixpkgs.get(), List.items, ProviderStart, QueriedProvider);
+            Provider = ProviderKind::Nixpkgs;
+            break;
           }
           // A "select" expression. e.g.
           // foo.a|
@@ -502,22 +530,42 @@ void Controller::onCompletion(const CompletionParams &Params,
           // foo.a.bar|
           case Node::NK_ExprSelect: {
             const auto &Select = static_cast<const nixf::ExprSelect &>(UpExpr);
-            completeSelect(EditRange, Select, *nixpkgsClient(), VLA, PM,
-                           N.kind() == Node::NK_Dot, List.items);
-            return List;
+            if (AttrSetClient *Client = Nixpkgs.get()) {
+              QueriedProvider = true;
+              completeSelect(EditRange, Select, *Client, VLA, PM,
+                             N.kind() == Node::NK_Dot, List.items);
+            }
+            Provider = ProviderKind::Nixpkgs;
+            break;
           }
           case Node::NK_ExprAttrs: {
-            completeAttrPath(EditRange, N, PM, OptionsLock, Options,
-                             ClientCaps.CompletionSnippets, List.items);
-            return List;
+            ProviderStart = List.items.size();
+            OptionsSucceeded =
+                OptionClients.CanQuery &&
+                completeAttrPath(EditRange, N, PM, OptionClients.Workers,
+                                 ClientCaps.CompletionSnippets, List.items);
+            Provider = ProviderKind::Options;
+            break;
           }
           default:
-            return List;
+            break;
           }
         } catch (ExceedSizeError &Err) {
           List.isIncomplete = true;
-          return List;
         }
+        if (Provider == ProviderKind::Nixpkgs && QueriedProvider &&
+            Nixpkgs.Worker && !isNixpkgsCurrent(Nixpkgs)) {
+          List.items.erase(List.items.begin() + ProviderStart,
+                           List.items.end());
+          List.isIncomplete = false;
+        }
+        if (Provider == ProviderKind::Options &&
+            (!OptionsSucceeded || !isOptionsCurrent(OptionClients))) {
+          List.items.erase(List.items.begin() + ProviderStart,
+                           List.items.end());
+          List.isIncomplete = false;
+        }
+        return List;
       }();
     }());
   };
@@ -527,7 +575,12 @@ void Controller::onCompletion(const CompletionParams &Params,
 void Controller::onCompletionItemResolve(const CompletionItem &Params,
                                          Callback<CompletionItem> Reply) {
 
-  auto Action = [Params, Reply = std::move(Reply), this]() mutable {
+  ProviderWorkLease ProviderWork = acquireProviderWork();
+  NixpkgsClientToken Nixpkgs =
+      ProviderWork ? acquireNixpkgsClient() : NixpkgsClientToken{};
+  auto Action = [Params, Reply = std::move(Reply), Nixpkgs = std::move(Nixpkgs),
+                 ProviderWork = std::move(ProviderWork), this]() mutable {
+    (void)ProviderWork;
     if (Params.data.empty()) {
       Reply(Params);
       return;
@@ -543,12 +596,16 @@ void Controller::onCompletionItemResolve(const CompletionItem &Params,
     llvm::json::Path::Root Root;
     fromJSON(*EV, Req, Root);
 
-    // FIXME: handle null nixpkgsClient()
-    NixpkgsCompletionProvider NCP(*nixpkgsClient());
+    AttrSetClient *Client = Nixpkgs.get();
+    if (!Client) {
+      Reply(Params);
+      return;
+    }
+    NixpkgsCompletionProvider NCP(*Client);
     CompletionItem Resp = Params;
     NCP.resolvePackage(Req.Scope, Params.label, Resp);
 
-    Reply(std::move(Resp));
+    Reply(isNixpkgsCurrent(Nixpkgs) ? std::move(Resp) : Params);
   };
   boost::asio::post(Pool, std::move(Action));
 }

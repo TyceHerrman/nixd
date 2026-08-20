@@ -121,19 +121,28 @@ void Controller::onInlayHint(const InlayHintsParams &Params,
   if (!EnableInlayHints)
     return Reply(std::vector<InlayHint>{});
 
+  ProviderWorkLease ProviderWork = acquireProviderWork();
+  NixpkgsClientToken Nixpkgs =
+      ProviderWork ? acquireNixpkgsClient() : NixpkgsClientToken{};
   auto Action = [Reply = std::move(Reply), URI = Params.textDocument.uri,
-                 Range = Params.range, this]() mutable {
+                 Range = Params.range, Nixpkgs = std::move(Nixpkgs),
+                 ProviderWork = std::move(ProviderWork), this]() mutable {
+    (void)ProviderWork;
     const auto File = URI.file();
     return Reply([&]() -> llvm::Expected<CheckTy> {
       const auto TU = CheckDefault(getTU(File));
       const auto AST = CheckDefault(getAST(*TU));
       // Perform inlay hints computation on the range.
       std::vector<InlayHint> Response;
-      NixpkgsInlayHintsProvider NP(*nixpkgsClient(), *TU->variableLookup(),
+      AttrSetClient *Client = Nixpkgs.get();
+      if (!Client)
+        return Response;
+      NixpkgsInlayHintsProvider NP(*Client, *TU->variableLookup(),
                                    *TU->parentMap(), Range, Response,
                                    TU->src());
       NP.dfs(AST.get());
-      return Response;
+      return isNixpkgsCurrent(Nixpkgs) ? std::move(Response)
+                                       : std::vector<InlayHint>{};
     }());
   };
   boost::asio::post(Pool, std::move(Action));

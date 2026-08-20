@@ -33,6 +33,8 @@ private:
   /// If the call has no response for a long time, it should be removed and
   /// associated an error.
   std::map<int, Callback<llvm::json::Value>> PendingCalls;
+  bool RequestGateClosed = false; // GUARDED_BY(PendingCallsLock)
+  std::string RequestGateReason;  // GUARDED_BY(PendingCallsLock)
 
   /// Number of maximum callbacks stored in the structure.
   /// Give an error to the oldest callback (least ID) while exceeding this
@@ -41,18 +43,14 @@ private:
 
   int TopID = 1;
 
-  /// Allocate an "ID" (as returned value) for this callback.
-  int bindReply(Callback<llvm::json::Value>);
-
   void callMethod(llvm::StringRef Method, llvm::json::Value Params,
-                  Callback<llvm::json::Value> CB, OutboundPort *O) {
-    llvm::json::Value ID(bindReply(std::move(CB)));
-    log("--> call {0}({1})", Method, ID.getAsInteger());
-    O->call(Method, Params, ID);
-  }
+                  Callback<llvm::json::Value> CB, OutboundPort *O);
+  static void failPendingCalls(std::map<int, Callback<llvm::json::Value>> Calls,
+                               llvm::StringRef Reason);
 
 protected:
   HandlerRegistry Registry;
+  void closeRequestGate(std::string Reason);
   template <class T>
   llvm::unique_function<void(const T &)>
   mkOutNotifiction(llvm::StringRef Method, OutboundPort *O = nullptr) {
@@ -89,6 +87,10 @@ public:
 
   /// \brief Close the inbound port.
   void closeInbound() { In->close(); }
+  void closeInboundAndRequests(std::string Reason) {
+    In->close();
+    closeRequestGate(std::move(Reason));
+  }
   void run();
 
   void switchStreamStyle(JSONStreamStyle Style) { In->StreamStyle = Style; }

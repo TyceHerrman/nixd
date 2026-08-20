@@ -15,6 +15,12 @@
 
 #include <llvm/Support/CommandLine.h>
 
+#include <cerrno>
+#include <chrono>
+#include <filesystem>
+#include <system_error>
+#include <unistd.h>
+
 using namespace nixd;
 using namespace util;
 using namespace llvm::json;
@@ -57,12 +63,78 @@ std::string getDefaultNixOSOptionsExpr() {
 
 } // namespace
 
-void Controller::evalExprWithProgress(AttrSetClient &Client,
-                                      const EvalExprParams &Params,
-                                      std::string_view Description) {
+Controller::ProviderWorkLease::~ProviderWorkLease() {
+  if (Owner)
+    Owner->releaseProviderWork();
+}
+
+Controller::ProviderWorkLease Controller::acquireProviderWork() {
+  std::lock_guard Guard(ProviderWorkLock);
+  if (ProviderWorkShutdown)
+    return {};
+  ++ProviderWorkCount;
+  return ProviderWorkLease(this);
+}
+
+void Controller::releaseProviderWork() {
+  bool Notify = false;
+  {
+    std::lock_guard Guard(ProviderWorkLock);
+    assert(ProviderWorkCount > 0);
+    Notify = --ProviderWorkCount == 0;
+  }
+  if (Notify)
+    ProviderWorkCV.notify_all();
+}
+
+Controller::ProviderShutdownState Controller::beginProviderShutdown() {
+  {
+    std::unique_lock Guard(ProviderWorkLock);
+    ProviderWorkShutdown = true;
+    // Preserve quick replies already admitted before exit, but never let a
+    // silent evaluator prevent the later gate closure and Pool.join().
+    ProviderWorkCV.wait_for(Guard, std::chrono::seconds(2),
+                            [this] { return ProviderWorkCount == 0; });
+  }
+
+  ProviderShutdownState Providers;
+  {
+    std::lock_guard Guard(NixpkgsStateLock);
+    ActiveNixpkgs = false;
+    EvaluatingNixpkgs = false;
+    ++NixpkgsGeneration;
+    Providers.Nixpkgs = std::move(NixpkgsEval);
+  }
+  {
+    std::lock_guard Guard(OptionsLock);
+    ++OptionsGeneration;
+    for (auto &[Name, Slot] : Options) {
+      (void)Name;
+      if (Slot.Worker)
+        Providers.Options.push_back(std::move(Slot.Worker));
+    }
+    Options.clear();
+  }
+
+  auto Close = [](const WorkerPtr &Worker) {
+    if (Worker)
+      if (AttrSetClient *Client = Worker->client())
+        Client->closeInboundAndRequests("controller shutdown");
+  };
+  Close(Providers.Nixpkgs);
+  for (const WorkerPtr &Worker : Providers.Options)
+    Close(Worker);
+  return Providers;
+}
+
+void Controller::evalExprWithProgress(
+    AttrSetClient &Client, const EvalExprParams &Params,
+    std::string_view Description,
+    llvm::unique_function<void(bool)> OnComplete) {
   auto Token = rand();
   auto Action = [Token, Description = std::string(Description),
-                 this](llvm::Expected<EvalExprResponse> Resp) {
+                 OnComplete = std::move(OnComplete),
+                 this](llvm::Expected<EvalExprResponse> Resp) mutable {
     endWorkDoneProgress({
         .token = Token,
         .value = WorkDoneProgressEnd{.message = "evaluated " +
@@ -70,8 +142,10 @@ void Controller::evalExprWithProgress(AttrSetClient &Client,
     });
     if (!Resp) {
       lspserver::elog("{0} eval expr: {1}", Description, Resp.takeError());
+      OnComplete(false);
       return;
     }
+    OnComplete(true);
   };
   createWorkDoneProgress({Token});
   beginWorkDoneProgress({.token = Token,
@@ -83,10 +157,134 @@ void Controller::evalExprWithProgress(AttrSetClient &Client,
   Client.evalExpr(Params, std::move(Action));
 }
 
+Configuration Controller::builtinConfig() const {
+  Configuration Result;
+  Result.nixpkgs.expr = getDefaultNixpkgsExpr();
+  const std::string NixOSOptions = getDefaultNixOSOptionsExpr();
+  if (!NixOSOptions.empty())
+    Result.options.emplace("nixos", Configuration::OptionProvider{
+                                        .expr = NixOSOptions,
+                                    });
+  return Result;
+}
+
+void Controller::setStartupWarning(std::string Message) {
+  lspserver::elog("{0}", Message);
+  if (!PendingStartupWarning)
+    PendingStartupWarning = ShowMessageParams{
+        .type = MessageType::Warning,
+        .message = std::move(Message),
+    };
+}
+
+void Controller::selectWorkspaceRoot(const InitializeParams &Params) {
+  ProjectRoot = LaunchDirectory;
+  Root.path = LaunchDirectory;
+
+  if (Params.workspaceFoldersProvided && Params.workspaceFoldersCount > 1) {
+    setStartupWarning(llvm::formatv(
+        "cannot load project configuration with multiple workspace folders "
+        "({0} supplied)",
+        Params.workspaceFoldersCount));
+    SkipProjectConfig = true;
+    return;
+  }
+
+  std::optional<std::filesystem::path> Candidate;
+  std::string CandidateName;
+  std::optional<std::string> ParseError;
+  if (Params.rootUriProvided) {
+    CandidateName = "rootUri";
+    ParseError = Params.rootUriError;
+    if (Params.rootUri)
+      Candidate = Params.rootUri->file().str();
+  } else if (Params.rootPathProvided &&
+             (Params.rootPathError ||
+              (Params.rootPath && !Params.rootPath->empty()))) {
+    CandidateName = "rootPath";
+    ParseError = Params.rootPathError;
+    if (Params.rootPath)
+      Candidate = *Params.rootPath;
+  } else if (Params.workspaceFoldersProvided) {
+    CandidateName = "workspaceFolders[0]";
+    ParseError = Params.workspaceFoldersError;
+    if (Params.workspaceFolders && !Params.workspaceFolders->empty())
+      Candidate = Params.workspaceFolders->front().uri.file().str();
+  }
+
+  if (ParseError) {
+    setStartupWarning(
+        llvm::formatv("cannot use {0} as project configuration root: {1}",
+                      CandidateName, *ParseError));
+    SkipProjectConfig = true;
+    return;
+  }
+  if (!Candidate)
+    return;
+
+  std::error_code EC;
+  const std::filesystem::file_status Status =
+      std::filesystem::status(*Candidate, EC);
+  std::string Reason;
+  if (EC)
+    Reason = EC.message();
+  else if (!std::filesystem::exists(Status))
+    Reason =
+        std::make_error_code(std::errc::no_such_file_or_directory).message();
+  else if (!std::filesystem::is_directory(Status))
+    Reason = std::make_error_code(std::errc::not_a_directory).message();
+  else if (access(Candidate->c_str(), X_OK) != 0)
+    Reason = std::error_code(errno, std::generic_category()).message();
+
+  if (!Reason.empty()) {
+    setStartupWarning(
+        llvm::formatv("cannot use {0} as project configuration root {1}: {2}",
+                      CandidateName, Candidate->string(), Reason));
+    SkipProjectConfig = true;
+    return;
+  }
+
+  ProjectRoot = std::move(*Candidate);
+}
+
+void Controller::selectBaseConfig(CommandLineConfiguration CLI) {
+  Configuration Selected = builtinConfig();
+  Root.path = LaunchDirectory;
+
+  if (CLI.config) {
+    Selected = overlay(std::move(Selected), *CLI.config);
+  } else if (CLI.enableProjectConfig && !SkipProjectConfig) {
+    ProjectConfigLoadResult Loaded = loadProjectConfig(ProjectRoot.string());
+    if (Loaded.error) {
+      setStartupWarning(
+          llvm::formatv("failed to load project configuration at {0}: {1}",
+                        Loaded.error->path, Loaded.error->message));
+    } else if (Loaded.config) {
+      Selected = overlay(std::move(Selected), *Loaded.config);
+      Root.path = ProjectRoot;
+    }
+  }
+
+  {
+    std::lock_guard Guard(ConfigLock);
+    BaseConfig = Selected;
+  }
+  {
+    std::lock_guard Guard(ChildForkLock);
+    startNixpkgs(NixpkgsEval, Root.path);
+  }
+  updateConfig(std::move(Selected));
+}
+
 void Controller::
     onInitialize( // NOLINT(readability-convert-member-functions-to-static)
-        [[maybe_unused]] const InitializeParams &Params,
-        Callback<Value> Reply) {
+        const InitializeParams &Params, Callback<Value> Reply) {
+
+  LaunchDirectory = std::filesystem::current_path();
+  ProjectRoot = LaunchDirectory;
+  Root.path = LaunchDirectory;
+  SkipProjectConfig = false;
+  PendingStartupWarning.reset();
 
   Object ServerCaps{
       {{"textDocumentSync",
@@ -167,41 +365,40 @@ void Controller::
       {"capabilities", std::move(ServerCaps)},
   }};
 
-  Reply(std::move(Result));
-
   ClientCaps = Params.capabilities;
-
-  // Start default workers.
-  startNixpkgs(NixpkgsEval);
-
-  if (nixpkgsClient()) {
-    evalExprWithProgress(*nixpkgsClient(), getDefaultNixpkgsExpr(),
-                         "nixpkgs entries");
-  }
-
-  // Launch nixos worker also.
-  {
-    std::lock_guard _(OptionsLock);
-    startOption("nixos", Options["nixos"]);
-
-    if (AttrSetClient *Client = Options["nixos"]->client())
-      evalExprWithProgress(*Client, getDefaultNixOSOptionsExpr(),
-                           "nixos options");
-  }
   try {
-    Config = parseCLIConfig();
+    CommandLineConfiguration CLI = parseCLIConfig();
+    if (CLI.enableProjectConfig && !CLI.config)
+      selectWorkspaceRoot(Params);
+    selectBaseConfig(std::move(CLI));
   } catch (LLVMErrorException &Err) {
     lspserver::elog("parse CLI config error: {0}, {1}", Err.what(),
                     Err.takeError());
     std::exit(-1);
   }
-  fetchConfig();
+
+  Reply(std::move(Result));
 }
 
-void Controller::onInitialized(const lspserver::InitializedParams &Params) {}
+void Controller::onInitialized(const lspserver::InitializedParams &) {
+  if (PendingStartupWarning) {
+    auto ShowMessage =
+        mkOutNotifiction<ShowMessageParams>("window/showMessage");
+    ShowMessage(*PendingStartupWarning);
+    PendingStartupWarning.reset();
+  }
+  if (ClientCaps.WorkspaceConfiguration)
+    fetchConfig();
+}
 
 void Controller::onShutdown(const lspserver::NoParams &,
                             lspserver::Callback<std::nullptr_t> Reply) {
   ReceivedShutdown = true;
+  {
+    std::lock_guard Guard(WorkspaceConfigLock);
+    ++WorkspaceConfigGeneration;
+  }
+  closeRequestGate("server shutdown");
+  shutdownFormatters();
   Reply(nullptr);
 }

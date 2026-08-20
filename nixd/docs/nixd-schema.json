@@ -1,67 +1,93 @@
 {
-  "$comment": "https://github.com/nix-community/nixd/blob/main/docs/user-guide.md#configuration",
+  "$comment": "Strict configuration-patch grammar accepted by nixd.",
   "$id": "https://json.schemastore.org/nixd-schema.json",
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "definitions": {
-    "target": {
-      "description": "Nix installables that will be used for root translation unit.",
-      "type": "object",
-      "properties": {
-        "args": {
-          "description": "Accept args as \"nix eval\"",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "installable": {
-          "description": "\"nix eval\"",
-          "type": "string"
-        }
-      }
+  "title": "nixd configuration patch",
+  "description": "A strict patch for --config, an opted-in .nixd.json, or the nixd LSP editor section.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "description": "Optional string metadata. nixd does not fetch or interpret the referenced schema.",
+      "type": "string"
+    },
+    "nixpkgs": {
+      "$ref": "#/definitions/nixpkgs"
+    },
+    "formatting": {
+      "$ref": "#/definitions/formatting"
+    },
+    "options": {
+      "$ref": "#/definitions/options"
+    },
+    "diagnostic": {
+      "$ref": "#/definitions/diagnostic"
     }
   },
-  "properties": {
-    "eval": {
-      "description": "The evaluation section, provide auto completion for dynamic bindings.",
+  "definitions": {
+    "stringArray": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "nixpkgs": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
-        "target": {
-          "$ref": "#/definitions/target"
-        },
-        "depth": {
-          "description": "Extra depth for evaluation",
-          "type": "integer",
-          "default": 0
-        },
-        "workers": {
-          "description": "The number of workers for evaluation task. defaults to std::thread::hardware_concurrency",
-          "type": "integer"
+        "expr": {
+          "description": "Expression interpreted as the nixpkgs top level. An empty string disables evaluation.",
+          "type": "string"
         }
       }
     },
     "formatting": {
-      "command": {
-        "description": "Which command you would like to do formatting",
-        "default": "nixfmt",
-        "type": "string"
+      "description": "A nonempty command string or an object with an optional command array.",
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "$ref": "#/definitions/stringArray"
+            }
+          }
+        }
+      ]
+    },
+    "optionProvider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "expr"
+      ],
+      "properties": {
+        "expr": {
+          "description": "Expression evaluating to an option declaration attrset.",
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
     "options": {
-      "description": "Tell the language server your desired option set, for completion. This is lazily evaluated.",
+      "description": "A complete map of option providers. An empty object disables option providers.",
       "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/optionProvider"
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
       "properties": {
-        "enable": {
-          "description": "Enable option completion task. If you are writing a package, disable this",
-          "type": "boolean",
-          "default": "false"
-        },
-        "target": {
-          "$ref": "#/definitions/target"
+        "suppress": {
+          "$ref": "#/definitions/stringArray"
         }
       }
     }
-  },
-  "title": "JSON schema for nixd",
-  "type": "object"
+  }
 }

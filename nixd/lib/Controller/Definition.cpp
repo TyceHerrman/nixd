@@ -210,11 +210,10 @@ class OptionsDefinitionProvider {
 
 public:
   OptionsDefinitionProvider(AttrSetClient &Client) : Client(Client) {}
-  void resolveLocations(const std::vector<std::string> &Params,
+  bool resolveLocations(const std::vector<std::string> &Params,
                         Locations &Locs) {
     std::binary_semaphore Ready(0);
     Expected<OptionInfoResponse> Info = error("not replied");
-    OptionCompleteResponse Names;
     auto OnReply = [&Ready, &Info](llvm::Expected<OptionInfoResponse> Resp) {
       Info = std::move(Resp);
       Ready.release();
@@ -226,11 +225,12 @@ public:
 
     if (!Info) {
       elog("getting locations: {0}", Info.takeError());
-      return;
+      return false;
     }
 
     for (const auto &Decl : Info->Declarations)
       Locs.emplace_back(Decl);
+    return true;
   }
 };
 
@@ -256,20 +256,28 @@ std::optional<Location> definePath(const ExprPath &Path,
 /// \brief Get the locations of some attribute path.
 ///
 /// Usually this function will return a list of option declarations via RPC
-Locations defineAttrPath(const Node &N, const ParentMapAnalysis &PM,
-                         std::mutex &OptionsLock,
-                         Controller::OptionMapTy &Options) {
+Locations defineAttrPath(
+    const Node &N, const ParentMapAnalysis &PM,
+    const std::vector<
+        std::pair<std::string, std::shared_ptr<AttrSetClientProc>>> &Options,
+    bool &Success) {
   using PathResult = FindAttrPathResult;
   std::vector<std::string> Scope;
   auto R = findAttrPathForOptions(N, PM, Scope);
   Locations Locs;
   if (R == PathResult::OK) {
-    std::lock_guard _(OptionsLock);
     // For each option worker, try to get it's decl position.
-    for (const auto &[_, Client] : Options) {
-      if (AttrSetClient *C = Client->client()) {
-        OptionsDefinitionProvider ODP(*C);
-        ODP.resolveLocations(Scope, Locs);
+    for (const auto &[Name, Worker] : Options) {
+      (void)Name;
+      AttrSetClient *Client = Worker->client();
+      if (!Client) {
+        Success = false;
+        break;
+      }
+      OptionsDefinitionProvider ODP(*Client);
+      if (!ODP.resolveLocations(Scope, Locs)) {
+        Success = false;
+        break;
       }
     }
   }
@@ -319,16 +327,19 @@ std::vector<T> mergeVec(std::vector<T> A, const std::vector<T> &B) {
 
 llvm::Expected<Locations>
 defineVar(const ExprVar &Var, const VariableLookupAnalysis &VLA,
-          const ParentMapAnalysis &PM, AttrSetClient &NixpkgsClient,
+          const ParentMapAnalysis &PM, AttrSetClient *NixpkgsClient,
           const URIForFile &URI, llvm::StringRef Src) {
   try {
     Locations StaticLocs = defineVarStatic(Var, VLA, URI, Src);
 
     // Nixpkgs locations.
     try {
-      Selector Sel = mkVarSelector(Var, VLA, PM);
-      Locations NixpkgsLocs = defineNixpkgsSelector(Sel, NixpkgsClient);
-      return mergeVec(std::move(StaticLocs), NixpkgsLocs);
+      if (NixpkgsClient) {
+        Selector Sel = mkVarSelector(Var, VLA, PM);
+        Locations NixpkgsLocs = defineNixpkgsSelector(Sel, *NixpkgsClient);
+        return mergeVec(std::move(StaticLocs), NixpkgsLocs);
+      }
+      return StaticLocs;
     } catch (std::exception &E) {
       elog("definition/idiom/selector: {0}", E.what());
       return StaticLocs;
@@ -379,8 +390,17 @@ const Definition &nixd::findDefinition(const Node &N,
 void Controller::onDefinition(const TextDocumentPositionParams &Params,
                               Callback<llvm::json::Value> Reply) {
   using CheckTy = Locations;
+  ProviderWorkLease ProviderWork = acquireProviderWork();
+  NixpkgsClientToken Nixpkgs =
+      ProviderWork ? acquireNixpkgsClient() : NixpkgsClientToken{};
+  OptionClientToken OptionClients =
+      ProviderWork ? acquireOptionClients() : OptionClientToken{{}, 0, false};
   auto Action = [Reply = std::move(Reply), URI = Params.textDocument.uri,
-                 Pos = toNixfPosition(Params.position), this]() mutable {
+                 Pos = toNixfPosition(Params.position),
+                 Nixpkgs = std::move(Nixpkgs),
+                 OptionClients = std::move(OptionClients),
+                 ProviderWork = std::move(ProviderWork), this]() mutable {
+    (void)ProviderWork;
     const auto File = URI.file().str();
     return Reply(squash([&]() -> llvm::Expected<Locations> {
       const auto TU = CheckDefault(getTU(File));
@@ -391,20 +411,43 @@ void Controller::onDefinition(const TextDocumentPositionParams &Params,
       const auto &UpExpr = *CheckDefault(PM.upExpr(N));
 
       // Special case for inherited names.
-      if (const ExprVar *Var = findInheritVar(N, PM, VLA))
-        return defineVar(*Var, VLA, PM, *nixpkgsClient(), URI, TU->src());
+      if (const ExprVar *Var = findInheritVar(N, PM, VLA)) {
+        auto Result = defineVar(*Var, VLA, PM, Nixpkgs.get(), URI, TU->src());
+        if (Nixpkgs.Worker && !isNixpkgsCurrent(Nixpkgs)) {
+          if (!Result)
+            llvm::consumeError(Result.takeError());
+          return defineVar(*Var, VLA, PM, nullptr, URI, TU->src());
+        }
+        return Result;
+      }
 
       switch (UpExpr.kind()) {
       case Node::NK_ExprVar: {
         const auto &Var = static_cast<const ExprVar &>(UpExpr);
-        return defineVar(Var, VLA, PM, *nixpkgsClient(), URI, TU->src());
+        auto Result = defineVar(Var, VLA, PM, Nixpkgs.get(), URI, TU->src());
+        if (Nixpkgs.Worker && !isNixpkgsCurrent(Nixpkgs)) {
+          if (!Result)
+            llvm::consumeError(Result.takeError());
+          return defineVar(Var, VLA, PM, nullptr, URI, TU->src());
+        }
+        return Result;
       }
       case Node::NK_ExprSelect: {
         const auto &Sel = static_cast<const ExprSelect &>(UpExpr);
-        return defineSelect(Sel, VLA, PM, *nixpkgsClient());
+        Locations Result;
+        if (AttrSetClient *Client = Nixpkgs.get())
+          Result = defineSelect(Sel, VLA, PM, *Client);
+        return Nixpkgs.Worker && !isNixpkgsCurrent(Nixpkgs) ? Locations{}
+                                                            : std::move(Result);
       }
-      case Node::NK_ExprAttrs:
-        return defineAttrPath(N, PM, OptionsLock, Options);
+      case Node::NK_ExprAttrs: {
+        bool Success = OptionClients.CanQuery;
+        Locations Result;
+        if (Success)
+          Result = defineAttrPath(N, PM, OptionClients.Workers, Success);
+        return Success && isOptionsCurrent(OptionClients) ? std::move(Result)
+                                                          : Locations{};
+      }
       case Node::NK_ExprPath: {
         const auto &Path = static_cast<const ExprPath &>(UpExpr);
         if (auto Loc = definePath(Path, File))

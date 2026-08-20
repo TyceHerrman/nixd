@@ -3,6 +3,9 @@
 
 #include <llvm/Support/CommandLine.h>
 
+#include <cstdio>
+#include <unistd.h>
+
 using namespace llvm::cl;
 using namespace nixd;
 
@@ -22,21 +25,28 @@ opt<std::string> NixpkgsWorkerStderr{
 } // namespace
 
 void nixd::startAttrSetEval(const std::string &Name,
-                            std::unique_ptr<AttrSetClientProc> &Worker) {
-  Worker = std::make_unique<AttrSetClientProc>([&Name]() {
+                            std::shared_ptr<AttrSetClientProc> &Worker,
+                            const std::filesystem::path &Directory) {
+  Worker = std::make_shared<AttrSetClientProc>([Name, Directory]() {
     freopen(Name.c_str(), "w", stderr);
+    if (chdir(Directory.c_str()) != 0) {
+      perror("failed to change evaluator working directory");
+      return -1;
+    }
     return execl(AttrSetClient::getExe(), "nixd-attrset-eval", nullptr);
   });
 }
 
-void nixd::startNixpkgs(std::unique_ptr<AttrSetClientProc> &NixpkgsEval) {
-  startAttrSetEval(NixpkgsWorkerStderr, NixpkgsEval);
+void nixd::startNixpkgs(std::shared_ptr<AttrSetClientProc> &NixpkgsEval,
+                        const std::filesystem::path &Directory) {
+  startAttrSetEval(NixpkgsWorkerStderr, NixpkgsEval, Directory);
 }
 
 void nixd::startOption(const std::string &Name,
-                       std::unique_ptr<AttrSetClientProc> &Worker) {
+                       std::shared_ptr<AttrSetClientProc> &Worker,
+                       const std::filesystem::path &Directory) {
   std::string NewName = NULL_DEVICE;
   if (OptionWorkerStderr.getNumOccurrences())
     NewName = OptionWorkerStderr.getValue() + "/" + Name;
-  startAttrSetEval(NewName, Worker);
+  startAttrSetEval(NewName, Worker, Directory);
 }

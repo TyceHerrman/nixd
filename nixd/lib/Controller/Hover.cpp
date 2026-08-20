@@ -29,22 +29,25 @@ class OptionsHoverProvider {
 
 public:
   OptionsHoverProvider(AttrSetClient &Client) : Client(Client) {}
-  std::optional<OptionDescription>
-  resolveHover(const std::vector<std::string> &Scope) {
+  bool resolveHover(const std::vector<std::string> &Scope,
+                    std::optional<OptionDescription> &Desc) {
     std::binary_semaphore Ready(0);
-    std::optional<OptionDescription> Desc;
-    auto OnReply = [&Ready, &Desc](llvm::Expected<OptionInfoResponse> Resp) {
-      if (Resp)
+    bool Success = false;
+    auto OnReply = [&Ready, &Desc,
+                    &Success](llvm::Expected<OptionInfoResponse> Resp) {
+      if (Resp) {
         Desc = *Resp;
-      else
+        Success = true;
+      } else {
         elog("options hover: {0}", Resp.takeError());
+      }
       Ready.release();
     };
 
     Client.optionInfo(Scope, std::move(OnReply));
     Ready.acquire();
 
-    return Desc;
+    return Success;
   }
 };
 
@@ -207,9 +210,17 @@ std::optional<Hover> hoverSelect(const ExprSelect &Sel,
 void Controller::onHover(const TextDocumentPositionParams &Params,
                          Callback<std::optional<Hover>> Reply) {
   using CheckTy = std::optional<Hover>;
+  ProviderWorkLease ProviderWork = acquireProviderWork();
+  NixpkgsClientToken Nixpkgs =
+      ProviderWork ? acquireNixpkgsClient() : NixpkgsClientToken{};
+  OptionClientToken OptionClients =
+      ProviderWork ? acquireOptionClients() : OptionClientToken{{}, 0, false};
   auto Action = [Reply = std::move(Reply),
                  File = std::string(Params.textDocument.uri.file()),
-                 RawPos = Params.position, this]() mutable {
+                 RawPos = Params.position, Nixpkgs = std::move(Nixpkgs),
+                 OptionClients = std::move(OptionClients),
+                 ProviderWork = std::move(ProviderWork), this]() mutable {
+    (void)ProviderWork;
     return Reply([&]() -> llvm::Expected<CheckTy> {
       const auto TU = CheckDefault(getTU(File));
       const auto AST = CheckDefault(getAST(*TU));
@@ -222,60 +233,72 @@ void Controller::onHover(const TextDocumentPositionParams &Params,
 
       const auto &UpExpr = *CheckDefault(PM.upExpr(N));
 
-      // Try to get hover info from nixpkgs.
-      if (auto *Client = nixpkgsClient(); Client) {
-        switch (UpExpr.kind()) {
-        case Node::NK_ExprVar: {
+      switch (UpExpr.kind()) {
+      case Node::NK_ExprVar: {
+        if (AttrSetClient *Client = Nixpkgs.get()) {
           const auto &Var = static_cast<const ExprVar &>(UpExpr);
           if (auto H = hoverVar(Var, VLA, PM, *Client, TU->src()))
-            return *H;
-          break;
+            return isNixpkgsCurrent(Nixpkgs) ? std::move(H) : std::nullopt;
         }
-        case Node::NK_ExprSelect: {
+        break;
+      }
+      case Node::NK_ExprSelect: {
+        if (AttrSetClient *Client = Nixpkgs.get()) {
           const auto &Sel = static_cast<const ExprSelect &>(UpExpr);
           if (auto H = hoverSelect(Sel, VLA, PM, *Client, TU->src()))
-            return *H;
-          break;
+            return isNixpkgsCurrent(Nixpkgs) ? std::move(H) : std::nullopt;
         }
-        case Node::NK_ExprAttrs: {
-          // Try to get hover info from options.
-          auto Scope = std::vector<std::string>();
-          const auto R = findAttrPathForOptions(N, PM, Scope);
-          if (R == FindAttrPathResult::OK) {
-            std::lock_guard _(OptionsLock);
-            for (const auto &[_, Client] : Options) {
-              if (AttrSetClient *C = Client->client()) {
-                OptionsHoverProvider OHP(*C);
-                std::optional<OptionDescription> Desc = OHP.resolveHover(Scope);
-                std::string Docs;
-                if (Desc) {
-                  if (Desc->Type) {
-                    std::string TypeName = Desc->Type->Name.value_or("");
-                    std::string TypeDesc = Desc->Type->Description.value_or("");
-                    Docs += llvm::formatv("{0} ({1})", TypeName, TypeDesc);
-                  } else {
-                    Docs += "? (missing type)";
-                  }
-                  if (Desc->Description) {
-                    Docs += "\n\n" + Desc->Description.value_or("");
-                  }
-                  return Hover{
-                      .contents =
-                          MarkupContent{
-                              .kind = MarkupKind::Markdown,
-                              .value = std::move(Docs),
-                          },
-                      .range = toLSPRange(TU->src(), N.range()),
-                  };
-                }
-              }
+        break;
+      }
+      case Node::NK_ExprAttrs: {
+        auto Scope = std::vector<std::string>();
+        const auto R = findAttrPathForOptions(N, PM, Scope);
+        if (R == FindAttrPathResult::OK) {
+          bool Success = OptionClients.CanQuery;
+          std::optional<OptionDescription> Result;
+          for (const auto &[Ignored, Worker] : OptionClients.Workers) {
+            (void)Ignored;
+            AttrSetClient *Client = Worker->client();
+            if (!Client) {
+              Success = false;
+              break;
             }
+            OptionsHoverProvider OHP(*Client);
+            std::optional<OptionDescription> Desc;
+            if (!OHP.resolveHover(Scope, Desc)) {
+              Success = false;
+              break;
+            }
+            if (!Result && Desc)
+              Result = std::move(Desc);
           }
-          break;
+          if (!Success || !isOptionsCurrent(OptionClients) || !Result)
+            return std::nullopt;
+          std::string Docs;
+          if (Result->Type) {
+            std::string TypeName = Result->Type->Name.value_or("");
+            std::string TypeDesc = Result->Type->Description.value_or("");
+            Docs += llvm::formatv("{0} ({1})", TypeName, TypeDesc);
+          } else {
+            Docs += "? (missing type)";
+          }
+          if (Result->Description)
+            Docs += "\n\n" + Result->Description.value_or("");
+          return Hover{
+              .contents =
+                  MarkupContent{
+                      .kind = MarkupKind::Markdown,
+                      .value = std::move(Docs),
+                  },
+              .range = toLSPRange(TU->src(), N.range()),
+          };
         }
-        default:
-          break;
-        }
+        if (!isOptionsCurrent(OptionClients))
+          return std::nullopt;
+        break;
+      }
+      default:
+        break;
       }
 
       return std::nullopt;
