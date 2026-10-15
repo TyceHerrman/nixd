@@ -331,8 +331,7 @@ ApplyWork publishSpec(const std::shared_ptr<ProviderRegistryState> &Shared,
     Desired.emplace(ProviderKey::nixpkgs(), std::move(*Spec.Nixpkgs));
   for (auto &[Name, Expression] : Spec.Options) {
     if (!Expression.empty())
-      Desired.emplace(ProviderKey::option(std::move(Name)),
-                      std::move(Expression));
+      Desired.emplace(ProviderKey::option(Name), std::move(Expression));
   }
 
   ApplyWork Work;

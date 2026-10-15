@@ -120,8 +120,9 @@ std::optional<EditorConfigState::Generation> EditorConfigState::issue() {
 void EditorConfigState::submit(Generation Generation,
                                llvm::Expected<llvm::json::Value> Response) {
   auto State = Shared;
-  boost::asio::post(State->Strand, [State = std::move(State), Generation,
-                                    Response = std::move(Response)]() mutable {
+  auto Strand = State->Strand;
+  boost::asio::post(Strand, [State = std::move(State), Generation,
+                             Response = std::move(Response)]() mutable {
     applyResponse(State, Generation, std::move(Response));
   });
 }

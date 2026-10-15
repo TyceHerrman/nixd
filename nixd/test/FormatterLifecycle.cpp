@@ -496,24 +496,34 @@ TEST(FormatterLifecycle, RepeatedOutcomesKeepFDsStableAndReapOnce) {
   const size_t Before = countFormatterDescriptors();
   for (unsigned Iteration = 0; Iteration < 4; ++Iteration) {
     FormatterProcessRegistry Registry;
+    TemporaryPIDFile NormalRelease;
     auto Normal = std::async(std::launch::async, [&] {
-      return runFormatter(Registry, {"cat"}, std::filesystem::current_path(),
-                          "normal");
+      return runFormatter(
+          Registry,
+          {"sh", "-c", "while test -e \"$1\"; do sleep 0.01; done; exec cat",
+           "nixd-test", NormalRelease.path()},
+          std::filesystem::current_path(), "normal");
     });
     ExactProcessCleanup NormalCleanup;
     const pid_t NormalPID = waitForLeader(Registry);
     NormalCleanup.setLeader(NormalPID);
+    (void)::unlink(NormalRelease.path().c_str());
     ASSERT_GT(NormalPID, 0);
     EXPECT_EQ(Normal.get().Stdout, "normal");
     expectReaped(NormalPID);
 
+    TemporaryPIDFile ErrorRelease;
     auto Error = std::async(std::launch::async, [&] {
-      return runFormatter(Registry, {"sh", "-c", "exit 7"},
+      return runFormatter(Registry,
+                          {"sh", "-c",
+                           "while test -e \"$1\"; do sleep 0.01; done; exit 7",
+                           "nixd-test", ErrorRelease.path()},
                           std::filesystem::current_path(), "error");
     });
     ExactProcessCleanup ErrorCleanup;
     const pid_t ErrorPID = waitForLeader(Registry);
     ErrorCleanup.setLeader(ErrorPID);
+    (void)::unlink(ErrorRelease.path().c_str());
     ASSERT_GT(ErrorPID, 0);
     EXPECT_NE(Error.get().ExitStatus, 0);
     expectReaped(ErrorPID);

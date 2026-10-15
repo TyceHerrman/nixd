@@ -1134,9 +1134,18 @@ TEST(TransportLifecycle, AliveObservationLeavesExitedLeaderWaitableUntilStop) {
   errno = 0;
   EXPECT_EQ(::waitpid(Leader, &Status, WNOHANG), -1);
   EXPECT_EQ(errno, ECHILD);
-  errno = 0;
-  EXPECT_EQ(::kill(Descendant, 0), -1);
-  EXPECT_EQ(errno, ESRCH);
+  // Signal delivery and orphan reaping can finish after stop() reaps the
+  // leader.
+  const auto GoneDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  bool DescendantGone = false;
+  do {
+    errno = 0;
+    DescendantGone = ::kill(Descendant, 0) < 0 && errno == ESRCH;
+    if (!DescendantGone)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  } while (!DescendantGone && std::chrono::steady_clock::now() < GoneDeadline);
+  EXPECT_TRUE(DescendantGone);
 }
 
 TEST(TransportLifecycle,
@@ -1182,9 +1191,18 @@ TEST(TransportLifecycle,
               std::chrono::seconds(3));
   }
   ASSERT_EQ(::close(DescendantPipe[0]), 0);
-  errno = 0;
-  EXPECT_EQ(::kill(Descendant, 0), -1);
-  EXPECT_EQ(errno, ESRCH);
+  // Signal delivery and orphan reaping can finish after stop() reaps the
+  // leader.
+  const auto GoneDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  bool DescendantGone = false;
+  do {
+    errno = 0;
+    DescendantGone = ::kill(Descendant, 0) < 0 && errno == ESRCH;
+    if (!DescendantGone)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  } while (!DescendantGone && std::chrono::steady_clock::now() < GoneDeadline);
+  EXPECT_TRUE(DescendantGone);
 }
 
 TEST(TransportLifecycle, ForkPipedRoutesAllStreamsWhenParentStdioIsClosed) {
@@ -1620,8 +1638,9 @@ TEST(TransportLifecycle,
     const std::string Stderr = readAll(Err);
     AllRouted = AllRouted && Stdout == "stdout" && Stderr == "stderr";
     ASSERT_EQ(::close(Out), 0);
-    if (Err != Out)
+    if (Err != Out) {
       ASSERT_EQ(::close(Err), 0);
+    }
     int Status = 0;
     ASSERT_EQ(::waitpid(Child, &Status, 0), Child);
     ASSERT_TRUE(WIFEXITED(Status));
